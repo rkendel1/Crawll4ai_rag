@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 ARG PORT=8051
 
@@ -13,9 +13,10 @@ COPY . .
 # Install packages directly to the system (no virtual environment)
 # Combining commands to reduce Docker layers
 RUN uv pip install --system -e . && \
+    uv run python -m playwright install --with-deps chromium && \
     crawl4ai-setup
 
 EXPOSE ${PORT}
 
 # Command to run the MCP server
-CMD ["uv", "run", "src/crawl4ai_mcp.py"]
+CMD ["uv", "run", "src/mcp_server.py"]

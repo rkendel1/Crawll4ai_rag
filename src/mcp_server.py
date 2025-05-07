@@ -4,24 +4,10 @@ MCP server for web crawling with Crawl4AI.
 This server provides tools to crawl websites using Crawl4AI, automatically detecting
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
 """
-from mcp.server.fastmcp import FastMCP, Context
-from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse, urldefrag
-from xml.etree import ElementTree
-from dotenv import load_dotenv
-from supabase import Client
-from pathlib import Path
-import requests
-import asyncio
-import json
-import os
-import re
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-from utils import get_supabase_client, add_documents_to_supabase, search_documents
+from pathlib import Path
+import os
+from dotenv import load_dotenv
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -30,164 +16,33 @@ dotenv_path = project_root / '.env'
 # Force override of existing environment variables
 load_dotenv(dotenv_path, override=True)
 
-# Create a dataclass for our application context
-@dataclass
-class Crawl4AIContext:
-    """Context for the Crawl4AI MCP server."""
-    crawler: AsyncWebCrawler
-    supabase_client: Client
-    
-@asynccontextmanager
-async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
-    """
-    Manages the Crawl4AI client lifecycle.
-    
-    Args:
-        server: The FastMCP server instance
-        
-    Yields:
-        Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
-    """
-    # Create browser configuration
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False
-    )
-    
-    # Initialize the crawler
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.__aenter__()
-    
-    # Initialize Supabase client
-    supabase_client = get_supabase_client()
-    
-    try:
-        yield Crawl4AIContext(
-            crawler=crawler,
-            supabase_client=supabase_client
-        )
-    finally:
-        # Clean up the crawler
-        await crawler.__aexit__(None, None, None)
+from server import mcp
 
-# Initialize FastMCP server
-mcp = FastMCP(
-    "mcp-crawl4ai-rag",
-    description="MCP server for RAG and web crawling with Crawl4AI",
-    lifespan=crawl4ai_lifespan,
-    host=os.getenv("HOST", "0.0.0.0"),
-    port=os.getenv("PORT", "8051")
+from utils import (
+    add_documents_to_supabase, 
+    search_documents,
+    extract_section_info, 
+    smart_chunk_markdown, 
+    is_txt, 
+    is_sitemap,
+    parse_sitemap
 )
 
-def is_sitemap(url: str) -> bool:
-    """
-    Check if a URL is a sitemap.
-    
-    Args:
-        url: URL to check
-        
-    Returns:
-        True if the URL is a sitemap, False otherwise
-    """
-    return url.endswith('sitemap.xml') or 'sitemap' in urlparse(url).path
+# Import GitHub specific functions
+from crawler_github import crawl_github_repository_async, is_github_repository, extract_repo_info
+# Import functions from crawler_crawl4ai
+from crawler_crawl4ai import crawl_markdown_file, crawl_batch, crawl_recursive_internal_links
 
-def is_txt(url: str) -> bool:
-    """
-    Check if a URL is a text file.
-    
-    Args:
-        url: URL to check
-        
-    Returns:
-        True if the URL is a text file, False otherwise
-    """
-    return url.endswith('.txt')
+from mcp.server.fastmcp import Context
+from typing import Optional
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+import asyncio
+import json
 
-def parse_sitemap(sitemap_url: str) -> List[str]:
-    """
-    Parse a sitemap and extract URLs.
-    
-    Args:
-        sitemap_url: URL of the sitemap
-        
-    Returns:
-        List of URLs found in the sitemap
-    """
-    resp = requests.get(sitemap_url)
-    urls = []
+from crawl4ai import CrawlerRunConfig, CacheMode
 
-    if resp.status_code == 200:
-        try:
-            tree = ElementTree.fromstring(resp.content)
-            urls = [loc.text for loc in tree.findall('.//{*}loc')]
-        except Exception as e:
-            print(f"Error parsing sitemap XML: {e}")
 
-    return urls
-
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        # Calculate end position
-        end = start + chunk_size
-
-        # If we're at the end of the text, just take what's left
-        if end >= text_length:
-            chunks.append(text[start:].strip())
-            break
-
-        # Try to find a code block boundary first (```)
-        chunk = text[start:end]
-        code_block = chunk.rfind('```')
-        if code_block != -1 and code_block > chunk_size * 0.3:
-            end = start + code_block
-
-        # If no code block, try to break at a paragraph
-        elif '\n\n' in chunk:
-            # Find the last paragraph break
-            last_break = chunk.rfind('\n\n')
-            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_break
-
-        # If no paragraph break, try to break at a sentence
-        elif '. ' in chunk:
-            # Find the last sentence break
-            last_period = chunk.rfind('. ')
-            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_period + 1
-
-        # Extract chunk and clean it up
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move start position for next chunk
-        start = end
-
-    return chunks
-
-def extract_section_info(chunk: str) -> Dict[str, Any]:
-    """
-    Extracts headers and stats from a chunk.
-    
-    Args:
-        chunk: Markdown chunk
-        
-    Returns:
-        Dictionary with headers and stats
-    """
-    headers = re.findall(r'^(#+)\s+(.+)$', chunk, re.MULTILINE)
-    header_str = '; '.join([f'{h[0]} {h[1]}' for h in headers]) if headers else ''
-
-    return {
-        "headers": header_str,
-        "char_count": len(chunk),
-        "word_count": len(chunk.split())
-    }
 
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
@@ -351,7 +206,6 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 chunk_count += 1
         
         # Add to Supabase
-        # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
         batch_size = 20
         add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, batch_size=batch_size)
         
@@ -369,99 +223,6 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             "url": url,
             "error": str(e)
         }, indent=2)
-
-async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[str, Any]]:
-    """
-    Crawl a .txt or markdown file.
-    
-    Args:
-        crawler: AsyncWebCrawler instance
-        url: URL of the file
-        
-    Returns:
-        List of dictionaries with URL and markdown content
-    """
-    crawl_config = CrawlerRunConfig()
-
-    result = await crawler.arun(url=url, config=crawl_config)
-    if result.success and result.markdown:
-        return [{'url': url, 'markdown': result.markdown}]
-    else:
-        print(f"Failed to crawl {url}: {result.error_message}")
-        return []
-
-async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
-    """
-    Batch crawl multiple URLs in parallel.
-    
-    Args:
-        crawler: AsyncWebCrawler instance
-        urls: List of URLs to crawl
-        max_concurrent: Maximum number of concurrent browser sessions
-        
-    Returns:
-        List of dictionaries with URL and markdown content
-    """
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
-    dispatcher = MemoryAdaptiveDispatcher(
-        memory_threshold_percent=70.0,
-        check_interval=1.0,
-        max_session_permit=max_concurrent
-    )
-
-    results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
-
-async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
-    """
-    Recursively crawl internal links from start URLs up to a maximum depth.
-    
-    Args:
-        crawler: AsyncWebCrawler instance
-        start_urls: List of starting URLs
-        max_depth: Maximum recursion depth
-        max_concurrent: Maximum number of concurrent browser sessions
-        
-    Returns:
-        List of dictionaries with URL and markdown content
-    """
-    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
-    dispatcher = MemoryAdaptiveDispatcher(
-        memory_threshold_percent=70.0,
-        check_interval=1.0,
-        max_session_permit=max_concurrent
-    )
-
-    visited = set()
-
-    def normalize_url(url):
-        return urldefrag(url)[0]
-
-    current_urls = set([normalize_url(u) for u in start_urls])
-    results_all = []
-
-    for depth in range(max_depth):
-        urls_to_crawl = [normalize_url(url) for url in current_urls if normalize_url(url) not in visited]
-        if not urls_to_crawl:
-            break
-
-        results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
-        next_level_urls = set()
-
-        for result in results:
-            norm_url = normalize_url(result.url)
-            visited.add(norm_url)
-
-            if result.success and result.markdown:
-                results_all.append({'url': result.url, 'markdown': result.markdown})
-                for link in result.links.get("internal", []):
-                    next_url = normalize_url(link["href"])
-                    if next_url not in visited:
-                        next_level_urls.add(next_url)
-
-        current_urls = next_level_urls
-
-    return results_all
 
 @mcp.tool()
 async def get_available_sources(ctx: Context) -> str:
@@ -490,6 +251,7 @@ async def get_available_sources(ctx: Context) -> str:
             .execute()
             
         # Use a set to efficiently track unique sources
+        
         unique_sources = set()
         
         # Extract the source values from the result using a set for uniqueness
@@ -570,6 +332,154 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         return json.dumps({
             "success": False,
             "query": query,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
+async def crawl_github_repo(
+    ctx: Context, 
+    repo_url: str, 
+    max_depth: int = 5, # Note: max_depth is less relevant for ZIP download method
+    branch_name: Optional[str] = None, 
+    chunk_size: int = 5000,
+    save_files_locally: bool = True,
+    local_save_dir: str = "EXPORT_GITHUB"
+) -> str:
+    """
+    Crawls a GitHub repository by downloading it as a ZIP, extracts file contents, 
+    stores them in Supabase, and saves raw files locally.
+    // ... (args description remains the same)
+    """
+    try:
+        if not is_github_repository(repo_url):
+            return json.dumps({
+                "success": False,
+                "repo_url": repo_url,
+                "error": "Invalid GitHub repository URL provided."
+            }, indent=2)
+
+        # crawler = ctx.request_context.lifespan_context.crawler # No longer needed to pass to async func
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        github_auth_token = os.getenv("GITHUB_TOKEN")
+        
+        # Extract owner and repo name for metadata and local save path
+        try:
+            owner, repo, _, _ = extract_repo_info(repo_url)
+            # Construct a more specific save directory for this repo
+            repo_specific_save_dir = Path(local_save_dir) / owner / repo
+        except ValueError:
+            # Fallback if extract_repo_info fails
+            owner, repo = "unknown_owner", "unknown_repo"
+            repo_specific_save_dir = Path(local_save_dir) / "unknown_repo"
+
+
+        print(f"Starting GitHub repository crawl for: {repo_url} using ZIP download method.")
+        
+        crawled_files_data = await crawl_github_repository_async(
+            # crawler=crawler, # REMOVE THIS LINE - crawler is no longer an argument
+            repo_url=repo_url,
+            max_depth=max_depth, # Kept for consistency, though less used by ZIP method
+            branch_name=branch_name,
+            # max_concurrent is not used by the ZIP download method's async function
+            broadcast_progress=None, 
+            save_raw_content=save_files_locally,
+            output_dir_for_raw=str(repo_specific_save_dir),
+            github_token=github_auth_token # Pass the token
+        )
+        
+        if not crawled_files_data:
+            return json.dumps({
+                "success": True, # Crawl might be successful but find no processable files
+                "repo_url": repo_url,
+                "message": "No files found or processed in the repository.",
+                "files_processed": 0,
+                "chunks_stored": 0,
+                "files_saved_locally": 0
+            }, indent=2)
+            
+        urls_db = []
+        chunk_numbers = []
+        contents_db = []
+        metadatas_db = []
+        
+        processed_files_count = 0
+        total_chunks_stored = 0
+        locally_saved_files_count = 0
+
+        # Define text-based content types to process for Supabase
+        # This list can be expanded.
+        text_content_types_prefixes = [
+            'text/', 'application/json', 'application/xml', 'application/javascript', 
+            'application/x-python', # Common for .py if not text/x-python
+        ]
+
+        for file_data in crawled_files_data:
+            if file_data.get('success') and file_data.get('content'):
+                processed_files_count += 1
+                
+                # Check if file was saved by crawl_github_repository_async's internal logic
+                # This is an approximation; the function logs saving but doesn't return paths per file.
+                # We assume if save_files_locally was true and the file was fetched, it was attempted to be saved.
+                if save_files_locally:
+                     locally_saved_files_count +=1
+
+
+                content_type = file_data.get('content_type', 'application/octet-stream').lower()
+                
+                # Determine if content is text-based and suitable for chunking/embedding
+                is_text_content = any(content_type.startswith(prefix) for prefix in text_content_types_prefixes)
+                
+                if is_text_content:
+                    file_content_text = file_data['content']
+                    if isinstance(file_content_text, bytes):
+                        try:
+                            file_content_text = file_content_text.decode('utf-8')
+                        except UnicodeDecodeError:
+                            print(f"Could not decode file {file_data['title']} as UTF-8, skipping for Supabase.")
+                            continue # Skip this file for Supabase if not decodable text
+
+                    chunks = smart_chunk_markdown(file_content_text, chunk_size=chunk_size) # Using existing chunker
+                    
+                    for i, chunk in enumerate(chunks):
+                        urls_db.append(file_data['url']) # HTML URL of the file on GitHub
+                        chunk_numbers.append(i)
+                        contents_db.append(chunk)
+                        
+                        meta = extract_section_info(chunk) # Basic metadata from chunk
+                        meta["chunk_index"] = i
+                        meta["url"] = file_data['url']
+                        meta["source"] = urlparse(repo_url).netloc # e.g., github.com
+                        meta["repo_url"] = repo_url
+                        meta["file_path_in_repo"] = file_data.get('api_path', file_data['title'])
+                        meta["file_name"] = file_data['title']
+                        meta["content_type"] = content_type
+                        meta["crawl_tool"] = "crawl_github_repo"
+                        meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__) # Or use datetime
+                        metadatas_db.append(meta)
+                        total_chunks_stored += 1
+                else:
+                    print(f"Skipping Supabase storage for non-text content: {file_data['title']} (type: {content_type})")
+
+        if contents_db:
+            add_documents_to_supabase(supabase_client, urls_db, chunk_numbers, contents_db, metadatas_db)
+            
+        return json.dumps({
+            "success": True,
+            "repo_url": repo_url,
+            "files_discovered": len(crawled_files_data),
+            "files_processed_for_supabase": processed_files_count, # Files that had content and were successful
+            "chunks_stored_in_supabase": total_chunks_stored,
+            "files_saved_locally": locally_saved_files_count if save_files_locally else 0,
+            "local_save_directory_base": str(repo_specific_save_dir) if save_files_locally else None
+        }, indent=2)
+        
+    except Exception as e:
+        print(f"Error in crawl_github_repo for {repo_url}: {e}")
+        import traceback
+        traceback.print_exc()
+        return json.dumps({
+            "success": False,
+            "repo_url": repo_url,
             "error": str(e)
         }, indent=2)
 

@@ -1,0 +1,11 @@
+fastmcp
+python-dotenv
+supabase
+openai
+crawl4ai
+requests
+
+# uvicorn and other potential web server dependencies if running FastMCP as a web server directly
+uvicorn
+fastapi
+httpx
