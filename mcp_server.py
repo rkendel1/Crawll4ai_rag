@@ -5,22 +5,12 @@ This server provides tools to crawl websites using Crawl4AI, automatically detec
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
 """
 
-from pathlib import Path
-import os
-from dotenv import load_dotenv
+from src.crawler_github import crawl_github_repository_async, is_github_repository, extract_repo_info
+from src.crawler_crawl4ai import crawl_markdown_file, crawl_batch, crawl_recursive_internal_links
+from src.service.supabase import get_supabase_client, add_documents_to_supabase, search_documents
+from src.server import get_mcp_server, crawl4ai_lifespan
 
-# Load environment variables from the project root .env file
-project_root = Path(__file__).resolve().parent.parent
-dotenv_path = project_root / '.env'
-
-# Force override of existing environment variables
-load_dotenv(dotenv_path, override=True)
-
-from server import mcp
-
-from utils import (
-    add_documents_to_supabase, 
-    search_documents,
+from src.utils import (
     extract_section_info, 
     smart_chunk_markdown, 
     is_txt, 
@@ -28,21 +18,39 @@ from utils import (
     parse_sitemap
 )
 
-# Import GitHub specific functions
-from crawler_github import crawl_github_repository_async, is_github_repository, extract_repo_info
-# Import functions from crawler_crawl4ai
-from crawler_crawl4ai import crawl_markdown_file, crawl_batch, crawl_recursive_internal_links
-
-from mcp.server.fastmcp import Context
-from typing import Optional
-from urllib.parse import urlparse
-from dotenv import load_dotenv
-import asyncio
-import json
-
 from crawl4ai import CrawlerRunConfig, CacheMode
+from mcp.server.fastmcp import Context
+
+import os
+from typing import Optional
+from pathlib import Path
+
+import json
+from dotenv import load_dotenv
+from urllib.parse import urlparse
+import asyncio
+from functools import partial
 
 
+# Load environment variables from the project root .env file
+# project_root = Path(__file__).resolve().parent.parent
+dotenv_path = '.env'
+assert load_dotenv(dotenv_path, override=True)
+
+
+
+ # Initialize Supabase client
+supabase_client = get_supabase_client(url=os.environ['SUPABASE_URL'],
+                                      key= os.environ['SUPABASE_SERVICE_KEY'])
+
+partial_crawl4ai_lifespan = partial(crawl4ai_lifespan, supabase_client= supabase_client)
+
+
+mcp = get_mcp_server(
+    host = os.environ['MCP_HOST'],
+    port = os.environ['MCP_PORT'],
+    crawl4ai_lifespan=partial_crawl4ai_lifespan
+)
 
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
