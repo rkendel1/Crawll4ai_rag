@@ -19,6 +19,8 @@ from src.server import get_mcp_server, crawl4ai_lifespan
 dotenv_path = '.env' 
 load_dotenv(dotenv_path, override=True)
 
+print( os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_KEY'])
+
 # Create a partial function for the lifespan manager, injecting the supabase client
 partial_crawl4ai_lifespan = partial(crawl4ai_lifespan, 
                                     supabase_client=get_supabase_client(
@@ -28,8 +30,8 @@ partial_crawl4ai_lifespan = partial(crawl4ai_lifespan,
 
 # Get the MCP server instance
 mcp = get_mcp_server(
-    host=os.environ.get('MCP_HOST', '0.0.0.0'), # Use .get for defaults
-    port=int(os.environ.get('MCP_PORT', 8051)), # Ensure port is int
+    host=os.environ['MCP_HOST'], # Use .get for defaults
+    port=int(os.environ['MCP_PORT']), # Ensure port is int
     crawl4ai_lifespan=partial_crawl4ai_lifespan
 )
 

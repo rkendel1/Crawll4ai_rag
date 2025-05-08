@@ -8,8 +8,18 @@ from dataclasses import dataclass
 from supabase import Client
 from crawl4ai import AsyncWebCrawler, BrowserConfig
 
-from typing import Optional, Dict, Any, List
-import datetime
+from typing import Optional, Dict, Any, List, Annotated
+
+import datetime as dt
+
+from pydantic.functional_serializers import PlainSerializer
+
+def format_datetime(dt: dt.datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+CustomDateTime = Annotated[
+    dt.datetime, PlainSerializer(format_datetime, return_type=str)
+]
 
 class MCP_Response(BaseModel):
     success: bool
@@ -28,7 +38,7 @@ class CrawlerMetadata(BaseModel):
     chunk_index: int
     url: str  # Original URL of the content unit (page, file, etc.)
     source_domain: str  # e.g., "example.com", "github.com"
-    crawled_at: datetime.datetime # Timestamp of when crawling/chunking occurred
+    crawled_at: CustomDateTime # Timestamp of when crawling/chunking occurred
     crawler_tool: str # Name of the specific mcp tool (e.g., "crawl_single_page")
 
     # Content-derived metadata (from extract_section_info or file properties)

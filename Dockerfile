@@ -1,4 +1,4 @@
-FROM python:alpine
+FROM python:3.12-slim
 
 ARG PORT=8051
 
