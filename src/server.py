@@ -1,5 +1,6 @@
 from src.service.supabase import get_supabase_client
 
+from pydantic import BaseModel
 from mcp.server.fastmcp import FastMCP
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
@@ -7,7 +8,49 @@ from dataclasses import dataclass
 from supabase import Client
 from crawl4ai import AsyncWebCrawler, BrowserConfig
 
+from typing import Optional, Dict, Any, List
+import datetime
 
+class MCP_Response(BaseModel):
+    success: bool
+    message: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    tool_name: Optional[str] = None # To identify which tool generated the response
+
+    def to_json_str(self) -> str:
+        # Ensure indent is used and None values are excluded for cleaner output
+        return self.model_dump_json(indent=2, exclude_none=True)
+
+class CrawlerMetadata(BaseModel):
+    """Standardized metadata for documents stored in Supabase."""
+    # Core metadata
+    chunk_index: int
+    url: str  # Original URL of the content unit (page, file, etc.)
+    source_domain: str  # e.g., "example.com", "github.com"
+    crawled_at: datetime.datetime # Timestamp of when crawling/chunking occurred
+    crawler_tool: str # Name of the specific mcp tool (e.g., "crawl_single_page")
+
+    # Content-derived metadata (from extract_section_info or file properties)
+    document_title: Optional[str] = None # Title of the page or document
+    document_description: Optional[str] = None
+    document_keywords: Optional[List[str]] = None
+    content_headings: Optional[List[str]] = None # Headings within the chunk or document
+
+    # Source-specific metadata
+    file_name: Optional[str] = None # For file-based crawls (GitHub, .txt)
+    file_path_in_source: Optional[str] = None # e.g., path in GitHub repo, path in website
+    source_repo_url: Optional[str] = None # For GitHub crawls, the main repository URL
+    content_type: Optional[str] = None # MIME type, if applicable
+
+    # To allow for any other specific metadata not covered
+    additional_info: Optional[Dict[str, Any]] = None
+
+    def to_supabase_dict(self) -> Dict[str, Any]:
+        """Returns a dictionary representation suitable for Supabase, excluding None values."""
+        # Pydantic's model_dump handles datetime serialization to ISO format by default if the model field is datetime
+        # and the target (like JSON) requires string. Supabase client might handle datetime objects directly.
+        return self.model_dump(exclude_none=True)
 
 # Create a dataclass for our application context
 @dataclass
@@ -66,4 +109,3 @@ def get_mcp_server(host, port, crawl4ai_lifespan) -> FastMCP:
         lifespan=crawl4ai_lifespan,
         host=host,
         port=port)
-    

@@ -1,104 +1,66 @@
-# import os
-# import asyncio
-# import uvicorn
-# from fastapi import FastAPI
-# from fastapi.staticfiles import StaticFiles
-# from fastapi.responses import FileResponse
-# from fastapi.middleware.cors import CORSMiddleware
-# from dotenv import load_dotenv
-# from pathlib import Path
-# from contextlib import asynccontextmanager
-# from mcp.server.fastmcp import FastMCP, Context
+"""
+MCP server for web crawling with Crawl4AI.
 
-# # --- Load environment variables ---
-# # necessary befor loading mcp
-# assert load_dotenv('.env')
+This server provides tools to crawl websites using Crawl4AI, automatically detecting
+the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
+"""
 
-# from src.server.server import mcp
-# # Import all tools to register them with the MCP server
-# from src.server.tools import crawl_single_page, smart_crawl_url, get_available_sources, perform_rag_query
+# Keep necessary imports for server setup and context
+import os
+
+import asyncio
+from functools import partial
+from dotenv import load_dotenv
+
+from src.service.supabase import get_supabase_client
+from src.server import get_mcp_server, crawl4ai_lifespan
 
 
+dotenv_path = '.env' 
+load_dotenv(dotenv_path, override=True)
 
-# # --- Define lifespan context manager ---
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     # Start MCP server when FastAPI starts
-#     print("Starting MCP server in lifespan context...")
-#     mcp_task = asyncio.create_task(run_mcp_server())
-    
-#     # Give the MCP server a moment to start and bind to its port
-#     await asyncio.sleep(1)
-    
-#     yield
-    
-#     # Cancel MCP server task when FastAPI shuts down
-#     print("Shutting down MCP server...")
-#     mcp_task.cancel()
-#     try:
-#         await mcp_task
-#     except asyncio.CancelledError:
-#         pass
-#     print("MCP server shutdown complete")
+# Create a partial function for the lifespan manager, injecting the supabase client
+partial_crawl4ai_lifespan = partial(crawl4ai_lifespan, 
+                                    supabase_client=get_supabase_client(
+                                        url=os.environ['SUPABASE_URL'],
+                                        key=os.environ['SUPABASE_SERVICE_KEY']
+))
 
+# Get the MCP server instance
+mcp = get_mcp_server(
+    host=os.environ.get('MCP_HOST', '0.0.0.0'), # Use .get for defaults
+    port=int(os.environ.get('MCP_PORT', 8051)), # Ensure port is int
+    crawl4ai_lifespan=partial_crawl4ai_lifespan
+)
 
-# # --- FastMCP Server Setup ---
-# app = FastAPI(lifespan=lifespan)
+import src.tools  as tools
+from src.tools import (smart_crawl, 
+                             crawl_single_page, 
+                             crawl_github_repo,
+                             crawl_text_file_tool, 
+                             crawl_sitemap_tool,
+                             crawl_recursive_webpages_tool, 
+                             perform_rag_query,
+                             get_available_sources)
+tools.mcp = mcp 
 
-# # Add CORS middleware
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],  # Allows all origins
-#     allow_credentials=True,
-#     allow_methods=["*"],  # Allows all methods
-#     allow_headers=["*"],  # Allows all headers
-# )
+mcp.add_tool(tools.smart_crawl)
+mcp.add_tool(tools.crawl_single_page)
+mcp.add_tool(tools.crawl_github_repo)
+mcp.add_tool(tools.crawl_text_file_tool)
+mcp.add_tool(tools.crawl_recursive_webpages_tool)
+mcp.add_tool(tools.perform_rag_query)
+mcp.add_tool(tools.get_available_sources)
+mcp.add_tool(tools.crawl_sitemap_tool)
 
-# # Mount the static directory for the frontend
-# app.mount("/static", StaticFiles(directory="src/static"), name="static")
+async def main():
+    transport = os.getenv("TRANSPORT", "sse")
+    if transport == 'sse':
+        # Run the MCP server with sse transport
+        await mcp.run_sse_async()
+    else:
+        # Run the MCP server with stdio transport
+        await mcp.run_stdio_async()
 
-
-# @app.get("/")
-# def read_index():
-#     return FileResponse("src/static/index.html")
-
-# # Add specific route for /index
-# @app.get("/index")
-# def read_index_alt():
-#     return FileResponse("src/static/index.html")
-
-# # Add this with your other routes
-# @app.get("/tools")
-# def read_tools():
-#     return FileResponse("src/static/tools.html")
-
-
-# # --- Entrypoint for running MCP server via SSE ---
-# async def run_mcp_server():
-#     transport = os.environ["TRANSPORT"]
-    
-#     try:
-#         if transport == "sse":
-#             await mcp.run_sse_async(
-#                 # host=host, port=port
-#                 )
-#         else:
-#             await mcp.run_stdio_async()
-#     except Exception as e:
-#         print(f"Error starting MCP server: {e}")
-#         import traceback
-#         print(traceback.format_exc())
-#         raise
-
-
-# if __name__ == "__main__":
-#     # Use a standard web port for the FastAPI application
-#     web_host = "0.0.0.0"  # Typically bind to all interfaces for web servers
-#     web_port = 8000  # Standard port for web applications
-    
-#     # Output access URL for clarity
-#     print(f"\n🚀 FastAPI application running at http://localhost:{web_port}")
-#     print(f"🔌 MCP server running at http://localhost:{os.getenv('PORT', 8051)}/sse\n")
-    
-#     # Run with uvicorn directly
-#     uvicorn.run(app, host=web_host, port=web_port)
+if __name__ == "__main__":
+    asyncio.run(main())
