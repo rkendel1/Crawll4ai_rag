@@ -39,6 +39,8 @@ async def crawl4ai_lifespan(server: FastMCP, supabase_client) -> AsyncIterator[C
     
     
     try:
+
+        print(supabase_client.supabase_url, supabase_client.supabase_key)
        
         yield Crawl4AIContext(
             crawler=crawler,

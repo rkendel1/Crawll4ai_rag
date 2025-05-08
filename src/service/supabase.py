@@ -15,7 +15,7 @@ def get_supabase_client(url, key) -> SupabaseClient:
     if not url or not key:
         raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment variables")
     
-    return create_client(url, key)
+    return create_client(supabase_url=url, supabase_key=key)
 
 def add_documents_to_supabase(
     client: SupabaseClient, 

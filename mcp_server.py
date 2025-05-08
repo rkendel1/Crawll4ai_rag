@@ -35,7 +35,7 @@ from functools import partial
 # Load environment variables from the project root .env file
 # project_root = Path(__file__).resolve().parent.parent
 dotenv_path = '.env'
-assert load_dotenv(dotenv_path, override=True)
+load_dotenv(dotenv_path, override=True)
 
 
 
@@ -366,7 +366,6 @@ async def crawl_github_repo(
                 "error": "Invalid GitHub repository URL provided."
             }, indent=2)
 
-        # crawler = ctx.request_context.lifespan_context.crawler # No longer needed to pass to async func
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         github_auth_token = os.getenv("GITHUB_TOKEN")
         
