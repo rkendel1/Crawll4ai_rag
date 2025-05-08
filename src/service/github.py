@@ -150,12 +150,6 @@ def _get_content_type_from_filename(filename: str) -> str:
     return 'application/octet-stream' # Default for unknown binary or text
 
 
-def is_github_repository(url: str) -> bool:
-    """
-    Check if a URL is a GitHub repository.
-    """
-    return bool(re.match(r'https?://github\.com/[^/]+/[^/]+(/.*)?$', url))
-
 
 def extract_repo_info(url: str) -> Tuple[str, str, str, str]:
     """
@@ -213,7 +207,7 @@ async def crawl_github_repository_async(
     branch_name: Optional[str] = None,
     broadcast_progress: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     save_raw_content: bool = True, 
-    output_dir_for_raw: str = "EXPORT_GITHUB",
+    output_dir_for_raw: str = "EXPORT/GITHUB",
     github_token: Optional[str] = None 
 ) -> List[Dict[str, Any]]:
     """

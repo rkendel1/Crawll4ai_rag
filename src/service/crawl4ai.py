@@ -30,7 +30,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
         List of dictionaries with URL and markdown content
     """
     crawl_config = CrawlerRunConfig(
-            deep_crawl_strategy=generate_crawl_strategy(urls),
+            deep_crawl_strategy=generate_crawl_strategy(url),
 
     )
 
@@ -54,7 +54,9 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False,        deep_crawl_strategy=generate_crawl_strategy(urls),
+    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS,
+                                    stream=False,
+                                    deep_crawl_strategy=generate_crawl_strategy(urls),
 )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
@@ -79,7 +81,8 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     Returns:
         List of dictionaries with URL and markdown content
     """
-    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False,        deep_crawl_strategy=generate_crawl_strategy(urls),
+    crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False,
+                                    deep_crawl_strategy=generate_crawl_strategy(start_urls),
 )
     dispatcher = MemoryAdaptiveDispatcher(
         memory_threshold_percent=70.0,
