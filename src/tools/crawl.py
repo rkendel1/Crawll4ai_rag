@@ -1,7 +1,7 @@
 import datetime
 import traceback
 import os
-import requests
+import logging
 
 from . import mcp
 from src.server import MCP_Response, CrawlerMetadata
@@ -31,6 +31,9 @@ from src.utils.files import save_raw_content_to_export
 
 DEFAULT_LOCAL_SAVE_DIR = "EXPORT"
 
+default_logger = logging.getLogger("DomoClientLogger")
+default_logger.setLevel(logging.INFO)
+
 # --- Individual Crawling Tools ---
 
 
@@ -49,6 +52,7 @@ async def crawl_single_page(
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
+        domo_client = ctx.request_context.lifespan_context.domo_client
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
         result = await crawler.arun(url=url, config=run_config)
 
@@ -90,6 +94,7 @@ async def crawl_single_page(
                     ),
                 )
                 metadatas.append(meta.to_supabase_dict())
+                domo_client.upsert_text_embedding(content=chunk)
 
             if contents:
                 url_to_full_document = {url: result.markdown}
@@ -101,7 +106,6 @@ async def crawl_single_page(
                     metadatas=metadatas,
                     url_to_full_document=url_to_full_document,
                 )
-
             response_data = {
                 "url": url,
                 "chunks_stored": len(chunks),

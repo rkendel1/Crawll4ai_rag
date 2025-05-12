@@ -22,7 +22,7 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
     }
 
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
+def smart_chunk_markdown(text: str, chunk_size: int = 2000) -> List[str]:
     """Split text into chunks, respecting code blocks and paragraphs."""
     chunks = []
     start = 0
