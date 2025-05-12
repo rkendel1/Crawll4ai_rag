@@ -1,7 +1,7 @@
 import datetime
 import traceback
 import os
-# import re # No longer needed here
+import requests
 
 from . import mcp
 from src.server import MCP_Response, CrawlerMetadata
@@ -12,23 +12,35 @@ from typing import Optional, List, Dict, Any
 from mcp.server.fastmcp import Context
 from crawl4ai import CrawlerRunConfig, CacheMode
 
-
-# Import functions from your other source files
-from src.service.github import crawl_github_repository_async, extract_repo_info
-from src.service.crawl4ai import crawl_markdown_file, crawl_batch, crawl_recursive_internal_links
+from src.service.github import (
+    extract_repo_info,
+    download_github_repo,
+    CrawlException,
+    validate_github_url,
+)
+from src.service.crawl4ai import (
+    crawl_markdown_file,
+    crawl_batch,
+    crawl_recursive_internal_links,
+)
 from src.service.supabase import add_documents_to_supabase
 
 from src.utils.crawler import is_sitemap, is_txt, is_github_repository, parse_sitemap
 from src.utils.chunking import smart_chunk_markdown, extract_section_info
-from src.utils.files import save_raw_content_to_export # Import the existing utility
+from src.utils.files import save_raw_content_to_export
 
-# Default directory for local exports
-DEFAULT_LOCAL_SAVE_DIR = "EXPORT_CRAWLED_CONTENT"
+DEFAULT_LOCAL_SAVE_DIR = "EXPORT"
 
 # --- Individual Crawling Tools ---
 
+
 @mcp.tool()
-async def crawl_single_page(ctx: Context, url: str, save_files_locally: bool = True, local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR) -> str:
+async def crawl_single_page(
+    ctx: Context,
+    url: str,
+    save_files_locally: bool = True,
+    local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR,
+) -> str:
     """
     Crawl a single web page, store its content in Supabase, and save locally using utility.
     """
@@ -39,26 +51,23 @@ async def crawl_single_page(ctx: Context, url: str, save_files_locally: bool = T
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
         result = await crawler.arun(url=url, config=run_config)
-        
+
         if result.success and result.markdown:
             if save_files_locally:
-                # Use existing utility. Determine if content is HTML for correct metadata comment.
-                # The utility handles .html extension if content looks like HTML.
-                # For markdown from crawl4ai, it's usually not raw HTML.
-                # We can pass a hint or let the utility decide.
-                # Let's assume markdown should be saved as .md
                 local_file_path = await save_raw_content_to_export(
                     source_url_for_metadata=url,
                     content=result.markdown,
                     output_folder=local_save_dir,
-                    target_relative_path_hint=f"{Path(urlparse(url).path).name or urlparse(url).netloc}.md" 
-                                                if Path(urlparse(url).path).name or urlparse(url).netloc else "crawled_page.md"
+                    target_relative_path_hint=(
+                        f"{Path(urlparse(url).path).name or urlparse(url).netloc}.md"
+                        if Path(urlparse(url).path).name or urlparse(url).netloc
+                        else "crawled_page.md"
+                    ),
                 )
-
 
             chunks = smart_chunk_markdown(result.markdown)
             urls_db, chunk_numbers, contents, metadatas = [], [], [], []
-            
+
             for i, chunk in enumerate(chunks):
                 urls_db.append(url)
                 chunk_numbers.append(i)
@@ -74,177 +83,200 @@ async def crawl_single_page(ctx: Context, url: str, save_files_locally: bool = T
                     document_description=section_info.get("description"),
                     document_keywords=section_info.get("keywords"),
                     content_headings=section_info.get("headings"),
-                    additional_info={"local_file_path": local_file_path} if local_file_path else None
+                    additional_info=(
+                        {"local_file_path": local_file_path}
+                        if local_file_path
+                        else None
+                    ),
                 )
                 metadatas.append(meta.to_supabase_dict())
-            
+
             if contents:
                 url_to_full_document = {url: result.markdown}
-                add_documents_to_supabase(client = supabase_client,
-                                          urls=urls_db, chunk_numbers=chunk_numbers,
-                                          contents=contents,
-                                          metadatas=metadatas,
-                                          url_to_full_document=url_to_full_document,
-                                          )
-            
+                add_documents_to_supabase(
+                    client=supabase_client,
+                    urls=urls_db,
+                    chunk_numbers=chunk_numbers,
+                    contents=contents,
+                    metadatas=metadatas,
+                    url_to_full_document=url_to_full_document,
+                )
+
             response_data = {
-                "url": url, "chunks_stored": len(chunks), "content_length": len(result.markdown),
-                "links_count": {"internal": len(result.links.get("internal", [])), "external": len(result.links.get("external", []))},
-                "local_file_path": local_file_path
+                "url": url,
+                "chunks_stored": len(chunks),
+                "content_length": len(result.markdown),
+                "links_count": {
+                    "internal": len(result.links.get("internal", [])),
+                    "external": len(result.links.get("external", [])),
+                },
+                "local_file_path": local_file_path,
             }
-            return MCP_Response(success=True, message="Page crawled, content stored, and saved locally.", data=response_data, tool_name=tool_name).to_json_str()
+            return MCP_Response(
+                success=True,
+                message="Page crawled, content stored, and saved locally.",
+                data=response_data,
+                tool_name=tool_name,
+            ).to_json_str()
         else:
-            return MCP_Response(success=False, message=f"Failed to crawl page: {url}", error=result.error_message, data={"url": url}, tool_name=tool_name).to_json_str()
+            return MCP_Response(
+                success=False,
+                message=f"Failed to crawl page: {url}",
+                error=result.error_message,
+                data={"url": url},
+                tool_name=tool_name,
+            ).to_json_str()
     except Exception as e:
         print(f"Error in tool '{tool_name}': {e}\n{traceback.format_exc()}")
-        return MCP_Response(success=False, message=f"An error occurred in {tool_name} for {url}", error=str(e), data={"url": url}, tool_name=tool_name).to_json_str()
+        return MCP_Response(
+            success=False,
+            message=f"An error occurred in {tool_name} for {url}",
+            error=str(e),
+            data={"url": url},
+            tool_name=tool_name,
+        ).to_json_str()
+
 
 @mcp.tool()
 async def crawl_github_repo(
-    ctx: Context, 
-    repo_url: str, 
-    branch_name: Optional[str] = None, 
-    chunk_size: int = 5000, 
-    save_files_locally: bool = True, 
-    local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR
+    ctx: Context,
+    repo_url: str,
+    branch_name: Optional[str] = None,
+    chunk_size: int = 5000,
+    save_files_locally: bool = True,
+    local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR,
 ) -> str:
     """
-    Crawls a GitHub repository. Local saving is primarily handled by crawl_github_repository_async,
-    which uses save_raw_content_to_export internally.
+    Downloads a GitHub repository ZIP (private or public), processes its content,
+    stores it in Supabase, and optionally saves it locally.
     """
     tool_name = "crawl_github_repo"
+
+    if not validate_github_url(repo_url):
+        return MCP_Response(
+            success=False,
+            message="Invalid GitHub repository URL provided.",
+            data={"repo_url": repo_url},
+            tool_name=tool_name,
+        ).to_json_str()
+
+    github_auth_token = os.getenv("GITHUB_TOKEN")
+
     try:
-        if not is_github_repository(repo_url):
-            return MCP_Response(success=False, message="Invalid GitHub repository URL provided.", data={"repo_url": repo_url}, tool_name=tool_name).to_json_str()
+        # Extract repository info
+        owner, repo_name, branch_from_url, _ = extract_repo_info(repo_url)
+        branch_name = branch_name or branch_from_url or "main"
 
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        github_auth_token = os.getenv("GITHUB_TOKEN")
-        
-        owner, repo = "unknown_owner", "unknown_repo"
-        try:
-            owner, repo, _, _ = extract_repo_info(repo_url)
-        except ValueError:
-            path_segments = urlparse(repo_url).path.strip('/').split('/')
-            if len(path_segments) >= 2:
-                owner, repo = path_segments[0], path_segments[1]
-        
-        # The output_dir_for_raw in crawl_github_repository_async becomes the base for save_raw_content_to_export
-        repo_base_save_dir = Path(local_save_dir) # The utility will create subdirs based on target_relative_path_hint
-
-        print(f"Starting GitHub repository crawl for: {repo_url}. Local save active: {save_files_locally}")
-        
-        # crawl_github_repository_async should use save_raw_content_to_export internally
-        # and pass the correct target_relative_path_hint for each file.
-        crawled_files_data = await crawl_github_repository_async(
+        # Download and extract the repository
+        extracted_path = download_github_repo(
             repo_url=repo_url,
+            extract_to=local_save_dir,
+            github_token=github_auth_token,
             branch_name=branch_name,
-            broadcast_progress=None, 
-            save_raw_content=save_files_locally, 
-            output_dir_for_raw=local_save_dir, # Pass the base directory
-            github_token=github_auth_token
         )
-        
-        if not crawled_files_data:
-            response_data = {"repo_url": repo_url, "files_processed": 0, "chunks_stored": 0, "files_saved_locally": 0}
-            return MCP_Response(success=True, message="No files found or processed in the repository.", data=response_data, tool_name=tool_name).to_json_str()
-            
-        urls_db, chunk_numbers, contents_db, metadatas_db = [], [], [], []
-        processed_files_count, total_chunks_stored, locally_saved_files_count = 0, 0, 0
-        url_to_full_document = {} 
-        
-        text_content_types_prefixes = [
-            'text/', 'application/json', 'application/xml', 'application/javascript', 
-            'application/x-python', 'application/x-sh', 'application/x-csh', 
-            'application/rtf', 'application/csv'
-        ]
-        text_file_extensions = [
-            '.md', '.txt', '.py', '.js', '.json', '.yaml', '.yml', '.toml', '.xml', 
-            '.css', '.html', '.htm', '.rst', '.sh', '.ps1', '.bat', '.rb', '.java',
-            '.c', '.cpp', '.h', '.hpp', '.cs', '.go', '.php', '.pl', '.swift', '.kt',
-            '.kts', '.scala', '.sql', '.r', '.tex', '.log', '.ini', '.cfg', '.conf',
-            '.properties', '.env', '.dockerfile', 'dockerfile', '.gitignore', '.gitattributes',
-            '.csv', '.tsv'
-        ]
 
-        for file_data in crawled_files_data:
-            if file_data.get('success') and file_data.get('content'):
-                processed_files_count += 1
-                # 'local_path' should be returned by crawl_github_repository_async if saving occurred
-                if save_files_locally and file_data.get('local_path'):
-                     locally_saved_files_count +=1
+        # Process repository files
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        urls_db, chunk_numbers, contents, metadatas = [], [], [], []
+        url_to_full_document = {}
 
-                content_type = file_data.get('content_type', 'application/octet-stream').lower()
-                file_name_lower = file_data.get('title', '').lower()
-                
-                is_text_content = any(content_type.startswith(prefix) for prefix in text_content_types_prefixes) or \
-                                  any(file_name_lower.endswith(ext) for ext in text_file_extensions)
+        for file_path in Path(extracted_path).rglob("*"):
+            if (
+                file_path.is_file()
+                # and file_path.suffix in [
+                #     ".md",
+                #     ".txt",
+                #     ".py",
+                # ]
+            ):  # Process specific file types
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
 
-                if is_text_content:
-                    file_content_text = file_data['content']
-                    if isinstance(file_content_text, bytes):
-                        try:
-                            file_content_text = file_content_text.decode('utf-8', errors='replace')
-                        except UnicodeDecodeError:
-                            print(f"Could not decode file {file_data['title']} as UTF-8, skipping for Supabase.")
-                            continue
-                    
-                    doc_url_for_context = file_data.get('html_url', file_data['url'])
-                    url_to_full_document[doc_url_for_context] = file_content_text
+                # Chunk the content
+                chunks = smart_chunk_markdown(content, chunk_size=chunk_size)
 
-                    chunks = smart_chunk_markdown(file_content_text, chunk_size=chunk_size)
-                    
-                    for i, chunk in enumerate(chunks):
-                        urls_db.append(doc_url_for_context) 
-                        chunk_numbers.append(i)
-                        contents_db.append(chunk)
-                        
-                        section_info = extract_section_info(chunk)
-                        meta = CrawlerMetadata(
-                            chunk_index=i,
-                            url=doc_url_for_context, 
-                            source_domain=urlparse(repo_url).netloc,
-                            crawled_at=datetime.datetime.now(datetime.timezone.utc),
-                            crawler_tool=tool_name,
-                            document_title=section_info.get("title") or file_data['title'],
-                            document_description=section_info.get("description"),
-                            document_keywords=section_info.get("keywords"),
-                            content_headings=section_info.get("headings"),
-                            file_name=file_data['title'],
-                            file_path_in_source=file_data.get('path', file_data.get('api_path', file_data['title'])), 
-                            source_repo_url=repo_url,
-                            content_type=content_type,
-                            # 'local_path' comes from crawl_github_repository_async
-                            additional_info={"local_file_path": file_data.get('local_path')} if save_files_locally and file_data.get('local_path') else None
-                        )
-                        metadatas_db.append(meta.to_supabase_dict())
-                        total_chunks_stored += 1
-                else:
-                    print(f"Skipping Supabase storage for non-text/binary content: {file_data['title']} (type: {content_type})")
+                for i, chunk in enumerate(chunks):
+                    urls_db.append(str(file_path))
+                    chunk_numbers.append(i)
+                    contents.append(chunk)
+                    section_info = extract_section_info(chunk)
+                    meta = CrawlerMetadata(
+                        chunk_index=i,
+                        url=str(file_path),
+                        source_domain="github.com",
+                        crawled_at=datetime.datetime.now(datetime.timezone.utc),
+                        crawler_tool=tool_name,
+                        document_title=section_info.get("title") or file_path.name,
+                        document_description=section_info.get("description"),
+                        document_keywords=section_info.get("keywords"),
+                        content_headings=section_info.get("headings"),
+                        additional_info={
+                            "repository_url": repo_url,
+                            "branch": branch_name,
+                            "local_file_path": str(file_path),
+                        },
+                    )
+                    metadatas.append(meta.to_supabase_dict())
 
-        if contents_db:
-            add_documents_to_supabase(client=supabase_client, 
-                                      urls=urls_db,
-                                      chunk_numbers=chunk_numbers,
-                                      contents=contents_db,
-                                      metadatas=metadatas_db,
-                                      url_to_full_document=url_to_full_document)
-            
+                # Store the full document content
+                url_to_full_document[str(file_path)] = content
+
+        # Add documents to Supabase
+        if contents:
+            add_documents_to_supabase(
+                client=supabase_client,
+                urls=urls_db,
+                chunk_numbers=chunk_numbers,
+                contents=contents,
+                metadatas=metadatas,
+                url_to_full_document=url_to_full_document,
+            )
+
         response_data = {
-            "repo_url": repo_url, "files_discovered": len(crawled_files_data), 
-            "files_processed_for_supabase": processed_files_count,
-            "chunks_stored_in_supabase": total_chunks_stored, 
-            "files_saved_locally": locally_saved_files_count, 
-            "local_save_directory_base": local_save_dir if save_files_locally else None
+            "repo_url": repo_url,
+            "branch": branch_name,
+            "extracted_path": extracted_path,
+            "auth_used": bool(github_auth_token),
+            "files_processed": len(urls_db),
         }
-        return MCP_Response(success=True, message="GitHub repository processed.", data=response_data, tool_name=tool_name).to_json_str()
-        
+        return MCP_Response(
+            success=True,
+            message="Repository downloaded, processed, and stored successfully.",
+            data=response_data,
+            tool_name=tool_name,
+        ).to_json_str()
+
+    except CrawlException as e:
+        return MCP_Response(
+            success=False,
+            message=str(e),
+            error=str(e),
+            data={
+                "repo_url": repo_url,
+                "auth_used": bool(github_auth_token),
+            },
+            tool_name=tool_name,
+        ).to_json_str()
+
     except Exception as e:
-        print(f"Error in tool '{tool_name}' for {repo_url}: {e}\n{traceback.format_exc()}")
-        return MCP_Response(success=False, message=f"An error occurred in {tool_name} for {repo_url}", error=str(e), data={"repo_url": repo_url}, tool_name=tool_name).to_json_str()
+        print(f"Error in tool '{tool_name}': {e}\n{traceback.format_exc()}")
+        return MCP_Response(
+            success=False,
+            message="Failed to process repository.",
+            error=str(e),
+            data={"repo_url": repo_url},
+            tool_name=tool_name,
+        ).to_json_str()
 
 
 @mcp.tool()
-async def crawl_text_file_tool(ctx: Context, url: str, chunk_size: int = 5000, save_files_locally: bool = True, local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR) -> str:
+async def crawl_text_file_tool(
+    ctx: Context,
+    url: str,
+    chunk_size: int = 5000,
+    save_files_locally: bool = True,
+    local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR,
+) -> str:
     """
     Crawls a single text file, stores its content in Supabase, and saves locally using utility.
     """
@@ -253,29 +285,35 @@ async def crawl_text_file_tool(ctx: Context, url: str, chunk_size: int = 5000, s
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
-        crawl_results = await crawl_markdown_file(crawler, url) 
 
-        if not crawl_results or not crawl_results[0].get('markdown'):
-            return MCP_Response(success=False, message="No content found in text file.", data={"url": url}, tool_name=tool_name).to_json_str()
+        crawl_results = await crawl_markdown_file(crawler, url)
+
+        if not crawl_results or not crawl_results[0].get("markdown"):
+            return MCP_Response(
+                success=False,
+                message="No content found in text file.",
+                data={"url": url},
+                tool_name=tool_name,
+            ).to_json_str()
 
         doc = crawl_results[0]
-        source_url = doc['url']
-        md = doc['markdown'] 
-        
+        source_url = doc["url"]
+        md = doc["markdown"]
+
         if save_files_locally and md:
-            # Use the original filename from URL as hint for local saving
-            original_filename_hint = Path(urlparse(source_url).path).name or "crawled_text_file.txt"
+            original_filename_hint = (
+                Path(urlparse(source_url).path).name or "crawled_text_file.txt"
+            )
             local_file_path = await save_raw_content_to_export(
                 source_url_for_metadata=source_url,
                 content=md,
                 output_folder=local_save_dir,
-                target_relative_path_hint=original_filename_hint
+                target_relative_path_hint=original_filename_hint,
             )
 
         file_name_from_url = Path(urlparse(source_url).path).name
         chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
-        
+
         urls_db, chunk_numbers, contents, metadatas = [], [], [], []
         for i, chunk in enumerate(chunks):
             urls_db.append(source_url)
@@ -294,68 +332,115 @@ async def crawl_text_file_tool(ctx: Context, url: str, chunk_size: int = 5000, s
                 content_headings=section_info.get("headings"),
                 file_name=file_name_from_url,
                 file_path_in_source=urlparse(source_url).path,
-                additional_info={"local_file_path": local_file_path} if local_file_path else None
+                additional_info=(
+                    {"local_file_path": local_file_path} if local_file_path else None
+                ),
             )
             metadatas.append(meta.to_supabase_dict())
-        
-        if contents:
-            url_to_full_document = {source_url: md} 
-            add_documents_to_supabase(client=supabase_client, 
-                                      urls=urls_db, 
-                                      chunk_numbers=chunk_numbers, 
-                                      contents=contents, 
-                                      metadatas=metadatas,
-                                      url_to_full_document=url_to_full_document) 
 
-        response_data = {"url": url, "crawl_type": "text_file", "pages_crawled": 1, "chunks_stored": len(chunks), "urls_crawled": [source_url], "local_file_path": local_file_path}
-        return MCP_Response(success=True, message="Text file crawled, content stored, and saved locally.", data=response_data, tool_name=tool_name).to_json_str()
+        if contents:
+            url_to_full_document = {source_url: md}
+            add_documents_to_supabase(
+                client=supabase_client,
+                urls=urls_db,
+                chunk_numbers=chunk_numbers,
+                contents=contents,
+                metadatas=metadatas,
+                url_to_full_document=url_to_full_document,
+            )
+
+        response_data = {
+            "url": url,
+            "crawl_type": "text_file",
+            "pages_crawled": 1,
+            "chunks_stored": len(chunks),
+            "urls_crawled": [source_url],
+            "local_file_path": local_file_path,
+        }
+        return MCP_Response(
+            success=True,
+            message="Text file crawled, content stored, and saved locally.",
+            data=response_data,
+            tool_name=tool_name,
+        ).to_json_str()
     except Exception as e:
         print(f"Error in tool '{tool_name}': {e}\n{traceback.format_exc()}")
-        return MCP_Response(success=False, message=f"An error occurred in {tool_name} for {url}", error=str(e), data={"url": url}, tool_name=tool_name).to_json_str()
+        return MCP_Response(
+            success=False,
+            message=f"An error occurred in {tool_name} for {url}",
+            error=str(e),
+            data={"url": url},
+            tool_name=tool_name,
+        ).to_json_str()
+
 
 @mcp.tool()
-async def crawl_sitemap_tool(ctx: Context, url: str, max_concurrent: int = 10, chunk_size: int = 5000, save_files_locally: bool = True, local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR) -> str:
+async def crawl_sitemap_tool(
+    ctx: Context,
+    url: str,
+    max_concurrent: int = 10,
+    chunk_size: int = 5000,
+    save_files_locally: bool = True,
+    local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR,
+) -> str:
     """
     Extracts URLs from a sitemap, crawls them, stores content in Supabase, and saves locally using utility.
     """
     tool_name = "crawl_sitemap_tool"
-    saved_file_paths_map: Dict[str, Optional[str]] = {} # Store URL -> local_path
+    saved_file_paths_map: Dict[str, Optional[str]] = {}  # Store URL -> local_path
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
+
         sitemap_urls = parse_sitemap(url)
         if not sitemap_urls:
-            return MCP_Response(success=False, message="No URLs found in sitemap.", data={"url": url}, tool_name=tool_name).to_json_str()
+            return MCP_Response(
+                success=False,
+                message="No URLs found in sitemap.",
+                data={"url": url},
+                tool_name=tool_name,
+            ).to_json_str()
 
-        crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
+        crawl_results = await crawl_batch(
+            crawler, sitemap_urls, max_concurrent=max_concurrent
+        )
 
         if not crawl_results:
-            return MCP_Response(success=False, message="No content found from sitemap URLs.", data={"url": url, "sitemap_urls_count": len(sitemap_urls)}, tool_name=tool_name).to_json_str()
+            return MCP_Response(
+                success=False,
+                message="No content found from sitemap URLs.",
+                data={"url": url, "sitemap_urls_count": len(sitemap_urls)},
+                tool_name=tool_name,
+            ).to_json_str()
 
         urls_db, chunk_numbers, contents, metadatas = [], [], [], []
         chunk_count = 0
-        url_to_full_document = {} 
+        url_to_full_document = {}
 
         for doc in crawl_results:
-            if not doc.get('markdown'): continue 
-            source_url = doc['url']
-            md = doc['markdown']
-            url_to_full_document[source_url] = md 
-            
+            if not doc.get("markdown"):
+                continue
+            source_url = doc["url"]
+            md = doc["markdown"]
+            url_to_full_document[source_url] = md
+
             local_file_path_for_doc = None
             if save_files_locally and md:
-                # Use a hint for the filename, e.g., based on the URL path
-                path_name = Path(urlparse(source_url).path).name or urlparse(source_url).netloc
-                file_hint = f"{path_name}.md" if path_name else f"{urlparse(source_url).netloc}.md"
+                path_name = (
+                    Path(urlparse(source_url).path).name or urlparse(source_url).netloc
+                )
+                file_hint = (
+                    f"{path_name}.md"
+                    if path_name
+                    else f"{urlparse(source_url).netloc}.md"
+                )
                 local_file_path_for_doc = await save_raw_content_to_export(
                     source_url_for_metadata=source_url,
                     content=md,
                     output_folder=local_save_dir,
-                    target_relative_path_hint=file_hint
+                    target_relative_path_hint=file_hint,
                 )
                 saved_file_paths_map[source_url] = local_file_path_for_doc
-
 
             chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
             for i, chunk in enumerate(chunks):
@@ -375,72 +460,115 @@ async def crawl_sitemap_tool(ctx: Context, url: str, max_concurrent: int = 10, c
                     content_headings=section_info.get("headings"),
                     additional_info={
                         "sitemap_source_url": url,
-                        "local_file_path": saved_file_paths_map.get(source_url)
-                    }
+                        "local_file_path": saved_file_paths_map.get(source_url),
+                    },
                 )
                 metadatas.append(meta.to_supabase_dict())
                 chunk_count += 1
-        
+
         if contents:
-            add_documents_to_supabase(client=supabase_client, 
-                                      urls=urls_db, 
-                                      chunk_numbers=chunk_numbers, 
-                                      contents=contents, 
-                                      metadatas=metadatas, 
-                                      url_to_full_document=url_to_full_document, 
-                                      batch_size=20)
-        
+            add_documents_to_supabase(
+                client=supabase_client,
+                urls=urls_db,
+                chunk_numbers=chunk_numbers,
+                contents=contents,
+                metadatas=metadatas,
+                url_to_full_document=url_to_full_document,
+                batch_size=20,
+            )
+
         actual_saved_paths = [p for p in saved_file_paths_map.values() if p]
         response_data = {
-            "url": url, "crawl_type": "sitemap", "pages_crawled": len(crawl_results), 
-            "chunks_stored": chunk_count, "urls_in_sitemap": len(sitemap_urls),
+            "url": url,
+            "crawl_type": "sitemap",
+            "pages_crawled": len(crawl_results),
+            "chunks_stored": chunk_count,
+            "urls_in_sitemap": len(sitemap_urls),
             "locally_saved_files_count": len(actual_saved_paths),
-            "locally_saved_files_sample": actual_saved_paths[:5] + (["..."] if len(actual_saved_paths) > 5 else []),
-            "urls_crawled_sample": [doc['url'] for doc in crawl_results if doc.get('url')][:10] + (["..."] if len(crawl_results) > 10 else [])
+            "locally_saved_files_sample": actual_saved_paths[:5]
+            + (["..."] if len(actual_saved_paths) > 5 else []),
+            "urls_crawled_sample": [
+                doc["url"] for doc in crawl_results if doc.get("url")
+            ][:10]
+            + (["..."] if len(crawl_results) > 10 else []),
         }
-        return MCP_Response(success=True, message="Sitemap crawled, content stored, and saved locally.", data=response_data, tool_name=tool_name).to_json_str()
+        return MCP_Response(
+            success=True,
+            message="Sitemap crawled, content stored, and saved locally.",
+            data=response_data,
+            tool_name=tool_name,
+        ).to_json_str()
     except Exception as e:
         print(f"Error in tool '{tool_name}': {e}\n{traceback.format_exc()}")
-        return MCP_Response(success=False, message=f"An error occurred in {tool_name} for {url}", error=str(e), data={"url": url}, tool_name=tool_name).to_json_str()
+        return MCP_Response(
+            success=False,
+            message=f"An error occurred in {tool_name} for {url}",
+            error=str(e),
+            data={"url": url},
+            tool_name=tool_name,
+        ).to_json_str()
+
 
 @mcp.tool()
-async def crawl_recursive_webpages_tool(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, save_files_locally: bool = True, local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR) -> str:
+async def crawl_recursive_webpages_tool(
+    ctx: Context,
+    url: str,
+    max_depth: int = 3,
+    max_concurrent: int = 10,
+    chunk_size: int = 5000,
+    save_files_locally: bool = True,
+    local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR,
+) -> str:
     """
     Recursively crawls internal links, stores content in Supabase, and saves locally using utility.
     """
     tool_name = "crawl_recursive_webpages_tool"
-    saved_file_paths_map: Dict[str, Optional[str]] = {} # Store URL -> local_path
+    saved_file_paths_map: Dict[str, Optional[str]] = {}  # Store URL -> local_path
     try:
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
-        crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
+
+        crawl_results = await crawl_recursive_internal_links(
+            crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent
+        )
 
         if not crawl_results:
-            return MCP_Response(success=False, message="No content found during recursive crawl.", data={"url": url, "max_depth": max_depth}, tool_name=tool_name).to_json_str()
+            return MCP_Response(
+                success=False,
+                message="No content found during recursive crawl.",
+                data={"url": url, "max_depth": max_depth},
+                tool_name=tool_name,
+            ).to_json_str()
 
         urls_db, chunk_numbers, contents, metadatas = [], [], [], []
         chunk_count = 0
-        url_to_full_document = {} 
+        url_to_full_document = {}
 
         for doc in crawl_results:
-            if not doc.get('markdown'): continue
-            source_url = doc['url']
-            md = doc['markdown']
-            url_to_full_document[source_url] = md 
+            if not doc.get("markdown"):
+                continue
+            source_url = doc["url"]
+            md = doc["markdown"]
+            url_to_full_document[source_url] = md
 
             local_file_path_for_doc = None
             if save_files_locally and md:
-                path_name = Path(urlparse(source_url).path).name or urlparse(source_url).netloc
-                file_hint = f"{path_name}.md" if path_name else f"{urlparse(source_url).netloc}.md"
+                path_name = (
+                    Path(urlparse(source_url).path).name or urlparse(source_url).netloc
+                )
+                file_hint = (
+                    f"{path_name}.md"
+                    if path_name
+                    else f"{urlparse(source_url).netloc}.md"
+                )
                 local_file_path_for_doc = await save_raw_content_to_export(
                     source_url_for_metadata=source_url,
                     content=md,
                     output_folder=local_save_dir,
-                    target_relative_path_hint=file_hint
+                    target_relative_path_hint=file_hint,
                 )
                 saved_file_paths_map[source_url] = local_file_path_for_doc
-            
+
             chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
             for i, chunk in enumerate(chunks):
                 urls_db.append(source_url)
@@ -458,88 +586,134 @@ async def crawl_recursive_webpages_tool(ctx: Context, url: str, max_depth: int =
                     document_keywords=section_info.get("keywords"),
                     content_headings=section_info.get("headings"),
                     additional_info={
-                        "recursive_crawl_start_url": url, 
+                        "recursive_crawl_start_url": url,
                         "max_depth_setting": max_depth,
-                        "local_file_path": saved_file_paths_map.get(source_url)
-                    }
+                        "local_file_path": saved_file_paths_map.get(source_url),
+                    },
                 )
                 metadatas.append(meta.to_supabase_dict())
                 chunk_count += 1
-        
+
         if contents:
-            add_documents_to_supabase(client=supabase_client, 
-                                      urls=urls_db, 
-                                      chunk_numbers=chunk_numbers, 
-                                      contents=contents, 
-                                      metadatas=metadatas, 
-                                      url_to_full_document=url_to_full_document, 
-                                      batch_size=20)
+            add_documents_to_supabase(
+                client=supabase_client,
+                urls=urls_db,
+                chunk_numbers=chunk_numbers,
+                contents=contents,
+                metadatas=metadatas,
+                url_to_full_document=url_to_full_document,
+                batch_size=20,
+            )
 
         actual_saved_paths = [p for p in saved_file_paths_map.values() if p]
         response_data = {
-            "url": url, "crawl_type": "webpage_recursive", "pages_crawled": len(crawl_results), 
+            "url": url,
+            "crawl_type": "webpage_recursive",
+            "pages_crawled": len(crawl_results),
             "chunks_stored": chunk_count,
             "locally_saved_files_count": len(actual_saved_paths),
-            "locally_saved_files_sample": actual_saved_paths[:5] + (["..."] if len(actual_saved_paths) > 5 else []),
-            "urls_crawled_sample": [doc['url'] for doc in crawl_results if doc.get('url')][:10] + (["..."] if len(crawl_results) > 10 else [])
+            "locally_saved_files_sample": actual_saved_paths[:5]
+            + (["..."] if len(actual_saved_paths) > 5 else []),
+            "urls_crawled_sample": [
+                doc["url"] for doc in crawl_results if doc.get("url")
+            ][:10]
+            + (["..."] if len(crawl_results) > 10 else []),
         }
-        return MCP_Response(success=True, message="Recursive web crawl completed, content stored, and saved locally.", data=response_data, tool_name=tool_name).to_json_str()
+        return MCP_Response(
+            success=True,
+            message="Recursive web crawl completed, content stored, and saved locally.",
+            data=response_data,
+            tool_name=tool_name,
+        ).to_json_str()
     except Exception as e:
         print(f"Error in tool '{tool_name}': {e}\n{traceback.format_exc()}")
-        return MCP_Response(success=False, message=f"An error occurred in {tool_name} for {url}", error=str(e), data={"url": url}, tool_name=tool_name).to_json_str()
+        return MCP_Response(
+            success=False,
+            message=f"An error occurred in {tool_name} for {url}",
+            error=str(e),
+            data={"url": url},
+            tool_name=tool_name,
+        ).to_json_str()
 
 
 # --- Router Tool ---
 @mcp.tool()
-async def smart_crawl(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, branch_name: Optional[str] = None, save_files_locally: bool = True, local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR) -> str:
+async def smart_crawl(
+    ctx: Context,
+    url: str,
+    max_depth: int = 3,
+    max_concurrent: int = 10,
+    chunk_size: int = 5000,
+    branch_name: Optional[str] = None,
+    save_files_locally: bool = True,
+    local_save_dir: str = DEFAULT_LOCAL_SAVE_DIR,
+) -> str:
     """
     Smartly determines the type of URL and routes to the appropriate crawler.
     All crawlers will save files locally by default using the utility function.
     """
     tool_name = "smart_crawl"
-    print(f"Smart crawl initiated for URL: {url}. Local save: {save_files_locally}, Dir: {local_save_dir}")
+    print(
+        f"Smart crawl initiated for URL: {url}. Local save: {save_files_locally}, Dir: {local_save_dir}"
+    )
 
     try:
         if is_github_repository(url):
-            print(f"Smart crawl identified GitHub URL: {url}. Routing to crawl_github_repo.")
-            # crawl_github_repo itself uses crawl_github_repository_async, which should use save_raw_content_to_export
+            print(
+                f"Smart crawl identified GitHub URL: {url}. Routing to crawl_github_repo."
+            )
             return await crawl_github_repo(
-                ctx, 
-                url, 
-                branch_name=branch_name, 
-                chunk_size=chunk_size, 
-                save_files_locally=save_files_locally, 
-                local_save_dir=local_save_dir 
+                ctx,
+                url,
+                branch_name=branch_name,
+                chunk_size=chunk_size,
+                save_files_locally=save_files_locally,
+                local_save_dir=local_save_dir,
             )
         elif is_sitemap(url):
-            print(f"Smart crawl identified Sitemap URL: {url}. Routing to crawl_sitemap_tool.")
+            print(
+                f"Smart crawl identified Sitemap URL: {url}. Routing to crawl_sitemap_tool."
+            )
             return await crawl_sitemap_tool(
-                ctx, url, 
-                max_concurrent=max_concurrent, 
+                ctx,
+                url,
+                max_concurrent=max_concurrent,
                 chunk_size=chunk_size,
                 save_files_locally=save_files_locally,
-                local_save_dir=local_save_dir
+                local_save_dir=local_save_dir,
             )
-        elif is_txt(url): 
-            print(f"Smart crawl identified Text File URL: {url}. Routing to crawl_text_file_tool.")
+        elif is_txt(url):
+            print(
+                f"Smart crawl identified Text File URL: {url}. Routing to crawl_text_file_tool."
+            )
             return await crawl_text_file_tool(
-                ctx, url, 
+                ctx,
+                url,
                 chunk_size=chunk_size,
                 save_files_locally=save_files_locally,
-                local_save_dir=local_save_dir
+                local_save_dir=local_save_dir,
             )
-        else: 
-            print(f"Smart crawl identified Webpage URL: {url}. Routing to crawl_recursive_webpages_tool.")
+        else:
+            print(
+                f"Smart crawl identified Webpage URL: {url}. Routing to crawl_recursive_webpages_tool."
+            )
             return await crawl_recursive_webpages_tool(
-                ctx, url, 
-                max_depth=max_depth, 
-                max_concurrent=max_concurrent, 
+                ctx,
+                url,
+                max_depth=max_depth,
+                max_concurrent=max_concurrent,
                 chunk_size=chunk_size,
                 save_files_locally=save_files_locally,
-                local_save_dir=local_save_dir
+                local_save_dir=local_save_dir,
             )
-            
+
     except Exception as e:
         error_message = f"An error occurred in smart_crawl for URL '{url}': {e}"
         print(f"{error_message}\n{traceback.format_exc()}")
-        return MCP_Response(success=False, message=error_message, error=str(e), data={"url": url}, tool_name=tool_name).to_json_str()
+        return MCP_Response(
+            success=False,
+            message=error_message,
+            error=str(e),
+            data={"url": url},
+            tool_name=tool_name,
+        ).to_json_str()

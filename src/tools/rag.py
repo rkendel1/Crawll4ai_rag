@@ -30,6 +30,8 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     try:
         supabase_client_from_ctx = ctx.request_context.lifespan_context.supabase_client
         filter_metadata = {"source": source} if source and source.strip() else None
+
+        print(filter_metadata)
         
         results = search_documents(
             client=supabase_client_from_ctx,

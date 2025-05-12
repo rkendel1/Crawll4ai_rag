@@ -1,8 +1,0 @@
-{
-    "servers": {
-        "crawl4ai-rag": {
-            "type": "sse",
-            "url": "http://localhost:8051/sse"
-        }
-    }
-}
