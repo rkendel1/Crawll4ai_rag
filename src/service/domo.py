@@ -18,9 +18,13 @@ class DomoClient:
         """Initialize the DomoClient with environment variables and constants."""
         self.domo_host = host
         self.domo_developer_token = developer_token
-        self.domo_api_base = f"https://{self.domo_host}/api"
+        self.domo_base_url = f"https://{self.domo_host}/api"
         self.logger = logger
         self.index_id = index_id
+        self.common_headers = {
+            "X-DOMO-Developer-Token": self.domo_developer_token,
+            "Accept": "application/json"
+        }
 
     def create_vector_index(self, index_id: str) -> Dict[str, Any]:
         """
@@ -29,16 +33,12 @@ class DomoClient:
         :param index_id: The name of the vector index.
         :return: The response from the API.
         """
-        url = f"{self.domo_api_base}/api/recall/v1/indexes"
+        url = f"{self.domo_base_url}/api/recall/v1/indexes"
         body = {
             "indexId": index_id,
             "embeddingModel": "domo.domo_ai.domo-embed-text-multilingual-v1:cohere",
         }
-        headers = {
-            "X-DOMO-Developer-Token": self.domo_developer_token,
-            "Accept": "application/json"
-        }
-        response = requests.post(url, headers=headers, json=body)
+        response = requests.post(url, headers=self.common_headers, json=body)
         response.raise_for_status()
         return response.json()
 
@@ -52,7 +52,7 @@ class DomoClient:
         :return: The vector embedding for the image.
         """
         headers = {"X-Domo-Developer-Token": self.domo_developer_token}
-        result = requests.get(f"{self.domo_api_base}/data/v1/data-files/{file_id}", headers=headers)
+        result = requests.get(f"{self.domo_base_url}/data/v1/data-files/{file_id}", headers=headers)
         result.raise_for_status()
 
         blob = result.content
@@ -63,7 +63,7 @@ class DomoClient:
         if not validation_result["valid"]:
             raise ValueError(f"Invalid base64 image: {validation_result['error']}")
 
-        image_embedding_url = f"{self.domo_api_base}/ai/v1/embedding/image"
+        image_embedding_url = f"{self.domo_base_url}/ai/v1/embedding/image"
         body = {
             "input": [
                 {
@@ -74,11 +74,7 @@ class DomoClient:
             ],
             "model": "domo.domo_ai",
         }
-        headers = {
-            "X-DOMO-Developer-Token": self.domo_developer_token,
-            "Accept": "application/json"
-        }
-        response = requests.post(image_embedding_url, headers=headers, json=body)
+        response = requests.post(image_embedding_url, headers=self.common_headers, json=body)
         response.raise_for_status()
         return response.json()["embeddings"][0]
 
@@ -91,7 +87,7 @@ class DomoClient:
         :return: The response from the API.
         """
 
-        url = f"{self.domo_api_base}/recall/v1/indexes/{self.index_id}/upsert"
+        url = f"{self.domo_base_url}/recall/v1/indexes/{self.index_id}/upsert"
         body = {
             "nodes": [
                 {
@@ -100,11 +96,7 @@ class DomoClient:
                 }
             ]
         }
-        headers = {
-            "X-DOMO-Developer-Token": self.domo_developer_token,
-            "Accept": "application/json"
-        }
-        response = requests.post(url, headers=headers, json=body)
+        response = requests.post(url, headers=self.common_headers, json=body)
         response.raise_for_status()
         return response.json()
     def upsert_image_embedding(self, index_id: str, file_id: str, file_name: str) -> Dict[str, Any]:
@@ -118,7 +110,7 @@ class DomoClient:
         """
         embedding = self.embed_image(file_id, "IMAGE")
 
-        url = f"{self.domo_api_base}/recall/v1/indexes/{index_id}/upsert"
+        url = f"{self.domo_base_url}/recall/v1/indexes/{index_id}/upsert"
         body = {
             "nodes": [
                 {
@@ -131,11 +123,7 @@ class DomoClient:
                 }
             ]
         }
-        headers = {
-            "X-DOMO-Developer-Token": self.domo_developer_token,
-            "Accept": "application/json"
-        }
-        response = requests.post(url, headers=headers, json=body)
+        response = requests.post(url, headers=self.common_headers, json=body)
         response.raise_for_status()
         return response.json()
 
@@ -149,14 +137,9 @@ class DomoClient:
         :param public: Whether the file should be public (default is True).
         :return: The response from the API.
         """
-        url = f"{self.domo_api_base}/data/v1/data-files?name={file_name}&public={str(public).lower()}&description={description}"
-        headers = {
-            "X-DOMO-Developer-Token": self.domo_developer_token,
-            "Accept": "application/json"
-        }
-
+        url = f"{self.domo_base_url}/data/v1/data-files?name={file_name}&public={str(public).lower()}&description={description}"
         files = {'file': (file_name, file)}
-        response = requests.post(url, headers=headers, files=files)
+        response = requests.post(url, headers=self.common_headers, files=files)
         response.raise_for_status()
         return response.json()
 
@@ -215,4 +198,25 @@ class DomoClient:
             file.write(byte_string)
 
         return file_name
+
+    def get_query_text_results(self, input_text: str, top_k: int) -> Dict[str, Any]:
+        """
+        Query the vectorDB index for text results.
+
+        :param input_text: The input text to query.
+        :param top_k: The number of top results to retrieve.
+        :return: The response from the API.
+        """
+        try:
+            url = f"{self.domo_api_base}/recall/v1/indexes/{self.index_id}/query"
+            body = {
+                "input": input_text,
+                "topK": top_k
+            }
+            response = requests.post(url, headers=self.common_headers, json=body)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as error:
+            self.logger.error(f"Error querying text results: {error}")
+            raise
 
