@@ -88,7 +88,13 @@ async def crawl_single_page(
                     metadatas=metadatas,
                     url_to_full_document=url_to_full_document,
                 )
-                domo_client.upsert_text_embedding(markdown=result.markdown, url=url, tool_name=tool_name, local_file_path=url_to_full_document, file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc)
+                domo_client.upsert_text_embedding(
+                    markdown=result.markdown,
+                    url=url,
+                    tool_name=tool_name,
+                    local_file_path=url_to_full_document,
+                    file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
+                )
 
             response_data = {
                 "url": url,
@@ -206,7 +212,6 @@ async def crawl_github_repo(
                         },
                     )
                     metadatas.append(meta.to_dict())
-                    domo_client.upsert_text_embedding(content=chunk, meta=meta.to_domo_dict())
 
                 # Store the full document content
                 url_to_full_document[str(file_path)] = content
@@ -221,6 +226,14 @@ async def crawl_github_repo(
                 metadatas=metadatas,
                 url_to_full_document=url_to_full_document,
             )
+            domo_client.upsert_text_embedding(
+                markdown=content,
+                url=str(file_path),
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
+            )
+
 
         response_data = {
             "repo_url": repo_url,
@@ -316,7 +329,6 @@ async def crawl_text_file_tool(
 
         if contents:
             url_to_full_document = {source_url: md}
-            domo_client.upsert_text_embedding(content=contents, meta=meta.to_dict())
             add_documents_to_supabase(
                 client=supabase_client,
                 urls=urls_db,
@@ -325,7 +337,13 @@ async def crawl_text_file_tool(
                 metadatas=metadatas,
                 url_to_full_document=url_to_full_document,
             )
-
+            domo_client.upsert_text_embedding(
+                markdown=md,
+                url=url,
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
+            )
         response_data = {
             "url": url,
             "crawl_type": "text_file",
@@ -442,7 +460,6 @@ async def crawl_sitemap_tool(
                     },
                 )
                 metadatas.append(meta.to_dict())
-                domo_client.upsert_text_embedding(content=chunk, meta=meta.to_domo_dict())
                 chunk_count += 1
 
         if contents:
@@ -455,6 +472,14 @@ async def crawl_sitemap_tool(
                 url_to_full_document=url_to_full_document,
                 batch_size=20,
             )
+            domo_client.upsert_text_embedding(
+                markdown=md,
+                url=url,
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
+            )
+
 
         actual_saved_paths = [p for p in saved_file_paths_map.values() if p]
         response_data = {
@@ -572,7 +597,6 @@ async def crawl_recursive_webpages_tool(
                     },
                 )
                 metadatas.append(meta.to_dict())
-                domo_client.upsert_text_embedding(content=chunk, meta=meta.to_domo_dict())
                 chunk_count += 1
 
         if contents:
@@ -584,6 +608,13 @@ async def crawl_recursive_webpages_tool(
                 metadatas=metadatas,
                 url_to_full_document=url_to_full_document,
                 batch_size=20,
+            )
+            domo_client.upsert_text_embedding(
+                markdown=md,
+                url=url,
+                tool_name=tool_name,
+                local_file_path=url_to_full_document,
+                file_name_from_url=Path(urlparse(url).path).name or urlparse(url).netloc
             )
 
         actual_saved_paths = [p for p in saved_file_paths_map.values() if p]

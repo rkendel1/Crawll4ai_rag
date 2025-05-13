@@ -15,12 +15,12 @@ import re
 logging.basicConfig(level=logging.INFO)
 
 class DomoClient:
-    def __init__(self, logger: logging.Logger, index_id: str, host: str, developer_token: str):
+    def __init__(self, index_id: str, host: str, developer_token: str):
         """Initialize the DomoClient with environment variables and constants."""
         self.domo_host = host
         self.domo_developer_token = developer_token
         self.domo_base_url = f"https://{self.domo_host}/api"
-        self.logger = logger
+        self.logger = logging.getLogger(__name__)
         self.index_id = index_id
         self.common_headers = {
             "X-DOMO-Developer-Token": self.domo_developer_token,
@@ -91,8 +91,8 @@ class DomoClient:
         from src.utils.chunking import smart_chunk_markdown
         from src.utils.chunking import enrich_chunks_with_metadata
 
-        chunks = smart_chunk_markdown(markdown, 1800)
-        contents, metadata, _, __ = enrich_chunks_with_metadata(
+        chunks = smart_chunk_markdown(markdown, 1200)
+        _, __, contents, metadatas = enrich_chunks_with_metadata(
             chunks=chunks,
             source_url=url,
             tool_name=tool_name,
@@ -101,10 +101,10 @@ class DomoClient:
         )
         
         nodes = []
-
+        self.logger.info(f"Preparing {len(contents)} text embeddings to index {self.index_id}")
         for i in range(len(contents)):
             content = contents[i]
-            meta = metadata[i]
+            meta = metadatas[i]
 
             # Create a document with content and metadata
             document = {
@@ -123,6 +123,7 @@ class DomoClient:
         }
         response = requests.post(url, headers=self.common_headers, json=body)
         response.raise_for_status()
+        self.logger.info(f"Upserted {len(nodes)} text embeddings to index {self.index_id}")
         return response.json()
     def upsert_image_embedding(self, index_id: str, file_id: str, file_name: str) -> Dict[str, Any]:
         """

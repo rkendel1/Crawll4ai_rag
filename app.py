@@ -12,14 +12,11 @@ dotenv_path = '.env'
 load_dotenv(dotenv_path, override=True)
 
 import os
-import logging
 import asyncio
 from functools import partial
 
 from src.service.supabase import get_supabase_client
 from src.server import get_mcp_server, crawl4ai_lifespan
-
-
 
 print( os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_KEY'], os.environ['DOMO_HOST'], os.environ['DOMO_DEVELOPER_TOKEN'])
 
@@ -31,7 +28,6 @@ partial_crawl4ai_lifespan = partial(
         key=os.environ['SUPABASE_SERVICE_KEY']
     ), 
     domo_client=DomoClient(
-        logging.Logger,
         index_id=os.environ['DOMO_INDEX_ID'],
         host=os.environ['DOMO_HOST'],
         developer_token=os.environ['DOMO_DEVELOPER_TOKEN'])
