@@ -2,11 +2,12 @@
 # and create a class that will handle the connection
 # We will also need methods for creating data in domo
 
-from dataclasses import dataclass
+import json
 import logging
-import os
+from pathlib import Path
 from typing import Any, List, Dict
 import base64
+from urllib.parse import urlparse
 import requests
 import re
 
@@ -78,23 +79,47 @@ class DomoClient:
         response.raise_for_status()
         return response.json()["embeddings"][0]
 
-    def upsert_text_embedding(self, content: str) -> Dict[str, Any]:
+    def upsert_text_embedding(self, markdown: List[str], url: str, tool_name: str, local_file_path: str, file_name_from_url: str) -> Dict[str, Any]:
         """
         Upsert a text embedding into the vectorDB.
 
         :param index_id: The ID of the vector index.
         :param text: The text to embed.
+        :meta: The metadata to associate with the text.
         :return: The response from the API.
         """
+        from src.utils.chunking import smart_chunk_markdown
+        from src.utils.chunking import enrich_chunks_with_metadata
+
+        chunks = smart_chunk_markdown(markdown, 1800)
+        contents, metadata, _, __ = enrich_chunks_with_metadata(
+            chunks=chunks,
+            source_url=url,
+            tool_name=tool_name,
+            local_file_path=local_file_path,
+            file_name_from_url=file_name_from_url,
+        )
+        
+        nodes = []
+
+        for i in range(len(contents)):
+            content = contents[i]
+            meta = metadata[i]
+
+            # Create a document with content and metadata
+            document = {
+                "content": content,
+                "metadata": meta
+            }
+            enriched_content = json.dumps(document)
+            nodes.append({
+                "content": enriched_content,
+                "type": "TEXT",
+            })
 
         url = f"{self.domo_base_url}/recall/v1/indexes/{self.index_id}/upsert"
         body = {
-            "nodes": [
-                {
-                    "content": content,
-                    "type": "TEXT",
-                }
-            ]
+            "nodes": nodes
         }
         response = requests.post(url, headers=self.common_headers, json=body)
         response.raise_for_status()
@@ -208,7 +233,7 @@ class DomoClient:
         :return: The response from the API.
         """
         try:
-            url = f"{self.domo_api_base}/recall/v1/indexes/{self.index_id}/query"
+            url = f"{self.domo_base_url}/recall/v1/indexes/{self.index_id}/query"
             body = {
                 "input": input_text,
                 "topK": top_k

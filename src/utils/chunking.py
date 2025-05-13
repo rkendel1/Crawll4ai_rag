@@ -1,6 +1,10 @@
 
+import datetime
 import re
 from typing import List, Dict, Any
+from urllib.parse import urlparse
+
+from src.server import CrawlerMetadata
 
 def extract_section_info(chunk: str) -> Dict[str, Any]:
     """
@@ -22,7 +26,7 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
     }
 
 
-def smart_chunk_markdown(text: str, chunk_size: int = 2000) -> List[str]:
+def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
     """Split text into chunks, respecting code blocks and paragraphs."""
     chunks = []
     start = 0
@@ -66,3 +70,39 @@ def smart_chunk_markdown(text: str, chunk_size: int = 2000) -> List[str]:
         start = end
 
     return chunks
+
+def enrich_chunks_with_metadata(
+    chunks: List[str],
+    source_url: str,
+    tool_name: str,
+    local_file_path: str = None,
+    file_name_from_url: str = None
+) -> List[Dict[str, Any]]:
+    """
+    Enriches chunks with metadata for storage.
+    """
+
+    urls_db, chunk_numbers, contents, metadatas = [], [], [], []
+    for i, chunk in enumerate(chunks):
+        urls_db.append(source_url)
+        chunk_numbers.append(i)
+        contents.append(chunk)
+        section_info = extract_section_info(chunk)
+        meta = CrawlerMetadata(
+            chunk_index=i,
+            url=source_url,
+            source_domain=urlparse(source_url).netloc,
+            crawled_at=datetime.datetime.now(datetime.timezone.utc),
+            crawler_tool=tool_name,
+            document_title=section_info.get("title") or file_name_from_url,
+            document_description=section_info.get("description"),
+            document_keywords=section_info.get("keywords"),
+            content_headings=section_info.get("headings"),
+            file_name=file_name_from_url,
+            file_path_in_source=urlparse(source_url).path,
+            additional_info=(
+                {"local_file_path": local_file_path} if local_file_path else None
+            ),
+        )
+        metadatas.append(meta.to_dict())
+    return urls_db, chunk_numbers, contents, metadatas

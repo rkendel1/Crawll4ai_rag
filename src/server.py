@@ -1,5 +1,4 @@
 from src.service.domo import DomoClient
-from src.service.supabase import get_supabase_client
 
 from pydantic import BaseModel
 from mcp.server.fastmcp import FastMCP
@@ -57,17 +56,10 @@ class CrawlerMetadata(BaseModel):
     # To allow for any other specific metadata not covered
     additional_info: Optional[Dict[str, Any]] = None
 
-    def to_supabase_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """Returns a dictionary representation suitable for Supabase, excluding None values."""
         # Pydantic's model_dump handles datetime serialization to ISO format by default if the model field is datetime
         # and the target (like JSON) requires string. Supabase client might handle datetime objects directly.
-        return self.model_dump(exclude_none=True)
-    
-    def to_domo_dict(self) -> Dict[str, Any]:
-        """Returns a dictionary representation suitable for Domo, excluding None values."""
-        # Pydantic's model_dump handles datetime serialization to ISO format by default if the model field is datetime
-        # and the target (like JSON) requires string. Supabase client might handle datetime objects directly.
-        
         return self.model_dump(exclude_none=True)
 
 # Create a dataclass for our application context
@@ -103,7 +95,7 @@ async def crawl4ai_lifespan(server: FastMCP, supabase_client, domo_client) -> As
     try:
 
         print(supabase_client.supabase_url, supabase_client.supabase_key)
-        print(domo_client.domo_api_base, domo_client.index_id)
+        print(domo_client.domo_base_url, domo_client.index_id)
        
         yield Crawl4AIContext(
             crawler=crawler,

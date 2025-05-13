@@ -104,3 +104,53 @@ async def get_available_sources(ctx: Context) -> str:
         import traceback
         print(f"Error in tool '{tool_name}': {e}\n{traceback.format_exc()}")
         return MCP_Response(success=False, message=f"An error occurred in {tool_name}", error=str(e), tool_name=tool_name).to_json_str()
+
+
+@mcp.tool()
+async def perform_domo_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
+    """
+    Perform a query using the Domo search function on the stored content.
+    
+    This tool searches the Domo database for content relevant to the query and returns
+    the matching documents. Optionally filter by source domain.
+
+    Args:
+        ctx: The MCP server provided context
+        query: The search query
+        source: Optional source domain to filter results (e.g., 'example.com')
+        match_count: Maximum number of results to return (default: 5)
+    
+    Returns:
+        JSON string representation of an MCP_Response object.
+    """
+    tool_name = "perform_domo_query"
+    try:
+        domo_client_from_ctx = ctx.request_context.lifespan_context.domo_client
+        filter_metadata = {"source": source} if source and source.strip() else None
+
+        print(filter_metadata)
+        
+        results = domo_client_from_ctx.search_documents(
+            query=query,
+            match_count=match_count,
+            filter_metadata=filter_metadata
+        )
+        formatted_results = [
+            {
+                "url": r.get("url"),
+                "content": r.get("content"),
+                "metadata": r.get("metadata"),
+                "similarity": r.get("similarity")
+            } for r in results
+        ]
+        response_data = {
+            "query": query,
+            "source_filter": source,
+            "results": formatted_results,
+            "count": len(formatted_results)
+        }
+        return MCP_Response(success=True, message="Domo query performed successfully.", data=response_data, tool_name=tool_name).to_json_str()
+    except Exception as e:
+        import traceback
+        print(f"Error in tool '{tool_name}': {e}\n{traceback.format_exc()}")
+        return MCP_Response(success=False, message=f"An error occurred in {tool_name}", error=str(e), data={"query": query, "source_filter": source}, tool_name=tool_name).to_json_str()
