@@ -8,26 +8,6 @@ A powerful implementation of the [Model Context Protocol (MCP)](https://modelcon
 
 With this MCP server, you can <b>scrape anything</b> and then <b>use that knowledge anywhere</b> for RAG.
 
-The primary goal is to bring this MCP server into [Archon](https://github.com/coleam00/Archon) as I evolve it to be more of a knowledge engine for AI coding assistants to build AI agents. This first version of the Crawl4AI/RAG MCP server will be improved upon greatly soon, especially making it more configurable so you can use different embedding models and run everything locally with Ollama.
-
-## Overview
-
-This MCP server provides tools that enable AI agents to crawl websites, store content in a vector database (Supabase), and perform RAG over the crawled content. It follows the best practices for building MCP servers based on the [Mem0 MCP server template](https://github.com/coleam00/mcp-mem0/) I provided on my channel previously.
-
-## Vision
-
-The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
-
-1. **Integration with Archon**: Building this system directly into [Archon](https://github.com/coleam00/Archon) to create a comprehensive knowledge engine for AI coding assistants to build better AI agents.
-
-2. **Multiple Embedding Models**: Expanding beyond OpenAI to support a variety of embedding models, including the ability to run everything locally with Ollama for complete control and privacy.
-
-3. **Advanced RAG Strategies**: Implementing sophisticated retrieval techniques like contextual retrieval, late chunking, and others to move beyond basic "naive lookups" and significantly enhance the power and precision of the RAG system, especially as it integrates with Archon.
-
-4. **Enhanced Chunking Strategy**: Implementing a Context 7-inspired chunking approach that focuses on examples and creates distinct, semantically meaningful sections for each chunk, improving retrieval precision.
-
-5. **Performance Optimization**: Increasing crawling and indexing speed to make it more realistic to "quickly" index new documentation to then leverage it within the same prompt in an AI coding assistant.
-
 ## Features
 
 - **Smart URL Detection**: Automatically detects and handles different URL types (regular webpages, sitemaps, text files)
@@ -51,52 +31,82 @@ The server provides four essential web crawling and search tools:
 - [Docker/Docker Desktop](https://www.docker.com/products/docker-desktop/) if running the MCP server as a container (recommended)
 - [Python 3.12+](https://www.python.org/downloads/) if running the MCP server directly through uv
 - [Supabase](https://supabase.com/) (database for RAG)
-- [OpenAI API key](https://platform.openai.com/api-keys) (for generating embeddings)
+- API keys for your chosen providers:
+  - [OpenAI API key](https://platform.openai.com/api-keys) (if using OpenAI for embeddings or context generation)
+  - [AWS credentials](https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam.html) with access to Bedrock models (if using Bedrock for embeddings or context generation).
+    - For embeddings, the server uses `amazon.titan-embed-text-v1`.
+    - For context generation, the server is configured to use Claude 3.5 Sonnet via the `BEDROCK_CONTEXT_MODEL_ID` (e.g., `anthropic.claude-3-5-sonnet-20240620-v1:0`).
 
 ## Installation
 
 ### Using Docker (Recommended)
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
-   cd mcp-crawl4ai-rag
-   ```
+#### Pull from Docker Hub
 
-2. Build the Docker image:
-   ```bash
-   docker build -t mcp/crawl4ai-rag --build-arg PORT=8051 .
-   ```
+The pre-built image is published to Docker Hub under the `ignaciocardenas/mcp-crawl4ai-rag-softworks` repository. To download the latest version:
 
-3. Create a `.env` file based on the configuration section below
+```bash
+docker pull ignaciocardenas/mcp-crawl4ai-rag-softworks:latest
+```
 
-### Using uv directly (no Docker)
+#### Configure and Run with Custom Credentials
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
-   cd mcp-crawl4ai-rag
-   ```
+You can pass your credentials directly as environment variables when running the container:
 
-2. Install uv if you don't have it:
-   ```bash
-   pip install uv
-   ```
+```bash
+# Run in detached mode, exposing port 8051 and passing creds
+docker run -d \
+  --name crawl4ai-rag \
+  -p 8051:8051 \
+  -e OPENAI_API_KEY=your_openai_api_key \
+  -e SUPABASE_URL=your_supabase_url \
+  -e SUPABASE_SERVICE_KEY=your_supabase_service_key \
+  -e AWS_ACCESS_KEY_ID=your_aws_access_key_id \
+  -e AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key \
+  -e AWS_REGION=your_aws_region \
+  -e EMBEDDINGS_PROVIDER="openai" \
+  -e CONTEXT_PROVIDER="openai" \
+  -e BEDROCK_CONTEXT_MODEL_ID="anthropic.claude-3-5-sonnet-20240620-v1:0" \
+  ignaciocardenas/mcp-crawl4ai-rag-softworks:latest
+```
 
-3. Create and activate a virtual environment:
-   ```bash
-   uv venv
-   .venv\Scripts\activate
-   # on Mac/Linux: source .venv/bin/activate
-   ```
+Or load all variables from a local `.env` file (recommended for security):
 
-4. Install dependencies:
-   ```bash
-   uv pip install -e .
-   crawl4ai-setup
-   ```
+```bash
+# Create a .env file containing all required keys:
+# # Server Transport Configuration:
+# # TRANSPORT: "sse" or "stdio". 
+# #   - "sse": Server runs as an HTTP server with Server-Sent Events. HOST and PORT are required.
+# #   - "stdio": Server communicates over standard input/output. HOST and PORT are ignored.
+# HOST=0.0.0.0 # Required if TRANSPORT is "sse". The host address for the SSE server.
+# PORT=8051    # Required if TRANSPORT is "sse". The port for the SSE server.
+# TRANSPORT=sse
+# 
+# # API and Service Credentials:
+# OPENAI_API_KEY=...
+# SUPABASE_URL=...
+# SUPABASE_SERVICE_KEY=...
+# AWS_ACCESS_KEY_ID=...
+# AWS_SECRET_ACCESS_KEY=...
+# AWS_REGION=...
+# 
+# # Provider Configuration:
+# # EMBEDDINGS_PROVIDER: "openai" or "bedrock". (Optional, default: "openai")
+# #   - If "bedrock", uses 'amazon.titan-embed-text-v1'.
+# EMBEDDINGS_PROVIDER="openai"
+# # CONTEXT_PROVIDER: "openai" or "bedrock". (Optional, default: "openai")
+# #   - If "bedrock", uses the model specified in BEDROCK_CONTEXT_MODEL_ID.
+# CONTEXT_PROVIDER="openai"
+# # BEDROCK_CONTEXT_MODEL_ID: (Required if CONTEXT_PROVIDER is "bedrock")
+# #   Specifies the Claude 3.5 Sonnet model ID for context generation (e.g., "anthropic.claude-3-5-sonnet-20240620-v1:0").
+# BEDROCK_CONTEXT_MODEL_ID="anthropic.claude-3-5-sonnet-20240620-v1:0"
 
-5. Create a `.env` file based on the configuration section below
+docker run -d \
+  --name crawl4ai-rag \
+  --env-file ./path/to/.env \
+  -p 8051:8051 \
+  ignaciocardenas/mcp-crawl4ai-rag-softworks:latest
+```
 
 ## Database Setup
 
@@ -104,7 +114,77 @@ Before running the server, you need to set up the database with the pgvector ext
 
 1. Go to the SQL Editor in your Supabase dashboard (create a new project first if necessary)
 
-2. Create a new query and paste the contents of `crawled_pages.sql`
+2. Create a new query and paste the following SQL code:
+
+```sql
+-- Enable the pgvector extension
+create extension if not exists vector;
+
+-- Create the documentation chunks table
+create table crawled_pages (
+    id bigserial primary key,
+    url varchar not null,
+    chunk_number integer not null,
+    content text not null,  -- Added content column
+    metadata jsonb not null default '{}'::jsonb,  -- Added metadata column
+    embedding vector(1536),  -- OpenAI embeddings are 1536 dimensions
+    created_at timestamp with time zone default timezone('utc'::text, now()) not null,
+    
+    -- Add a unique constraint to prevent duplicate chunks for the same URL
+    unique(url, chunk_number)
+);
+
+-- Create an index for better vector similarity search performance
+create index on crawled_pages using ivfflat (embedding vector_cosine_ops);
+
+-- Create an index on metadata for faster filtering
+create index idx_crawled_pages_metadata on crawled_pages using gin (metadata);
+
+CREATE INDEX idx_crawled_pages_source ON crawled_pages ((metadata->>'source'));
+
+-- Create a function to search for documentation chunks
+create or replace function match_crawled_pages (
+  query_embedding vector(1536),
+  match_count int default 10,
+  filter jsonb DEFAULT '{}'::jsonb
+) returns table (
+  id bigint,
+  url varchar,
+  chunk_number integer,
+  content text,
+  metadata jsonb,
+  similarity float
+)
+language plpgsql
+as $$
+#variable_conflict use_column
+begin
+  return query
+  select
+    id,
+    url,
+    chunk_number,
+    content,
+    metadata,
+    1 - (crawled_pages.embedding <=> query_embedding) as similarity
+  from crawled_pages
+  where metadata @> filter
+  order by crawled_pages.embedding <=> query_embedding
+  limit match_count;
+end;
+$$;
+
+-- Enable RLS on the table
+alter table crawled_pages enable row level security;
+
+-- Create a policy that allows anyone to read
+create policy "Allow public read access"
+  on crawled_pages
+  for select
+  to public
+  using (true);
+
+```
 
 3. Run the query to create the necessary tables and functions
 
@@ -112,18 +192,43 @@ Before running the server, you need to set up the database with the pgvector ext
 
 Create a `.env` file in the project root with the following variables:
 
-```
-# MCP Server Configuration
-HOST=0.0.0.0
-PORT=8051
+```env
+# MCP Server Transport Configuration
+# TRANSPORT: "sse" or "stdio". 
+#   - "sse": Server runs as an HTTP server with Server-Sent Events. HOST and PORT are required.
+#   - "stdio": Server communicates over standard input/output. HOST and PORT are ignored.
 TRANSPORT=sse
 
-# OpenAI API Configuration
+# HOST: Required if TRANSPORT is "sse". The host address for the SSE server.
+HOST=0.0.0.0
+
+# PORT: Required if TRANSPORT is "sse". The port for the SSE server.
+PORT=8051
+
+# OpenAI API Configuration (Required if using OpenAI models)
 OPENAI_API_KEY=your_openai_api_key
 
-# Supabase Configuration
+# Supabase Configuration (Required for RAG)
 SUPABASE_URL=your_supabase_project_url
 SUPABASE_SERVICE_KEY=your_supabase_service_key
+
+# AWS Configuration (Required if using Bedrock models)
+AWS_ACCESS_KEY_ID=your_aws_access_key_id
+AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
+AWS_REGION=your_aws_region
+
+# Embeddings and Context Providers
+# EMBEDDINGS_PROVIDER: "openai" or "bedrock". (Optional, default: "openai")
+#   - If "bedrock", the server uses 'amazon.titan-embed-text-v1' for embeddings.
+EMBEDDINGS_PROVIDER="openai"
+
+# CONTEXT_PROVIDER: "openai" or "bedrock". (Optional, default: "openai")
+#   - If "bedrock", the server uses the model specified in BEDROCK_CONTEXT_MODEL_ID for context generation.
+CONTEXT_PROVIDER="openai"
+
+# BEDROCK_CONTEXT_MODEL_ID: (Required if CONTEXT_PROVIDER is "bedrock")
+#   Specifies the Claude 3.5 Sonnet model ID for context generation (e.g., "anthropic.claude-3-5-sonnet-20240620-v1:0").
+BEDROCK_CONTEXT_MODEL_ID="anthropic.claude-3-5-sonnet-20240620-v1:0"
 ```
 
 ## Running the Server
@@ -131,16 +236,15 @@ SUPABASE_SERVICE_KEY=your_supabase_service_key
 ### Using Docker
 
 ```bash
-docker run --env-file .env -p 8051:8051 mcp/crawl4ai-rag
+docker run -d --env-file .env -p 8051:8051 ignaciocardenas/mcp-crawl4ai-rag-softworks:latest
 ```
 
-### Using Python
+This command:
 
-```bash
-uv run src/crawl4ai_mcp.py
-```
-
-The server will start and listen on the configured host and port.
+- Runs the container in detached mode (`-d`)
+- Loads environment variables from the `.env` file
+- Maps port 8051 from the container to port 8051 on the host
+- Uses the latest version of the image
 
 ## Integration with MCP Clients
 
@@ -160,6 +264,7 @@ Once you have the server running with SSE transport, you can connect to it using
 ```
 
 > **Note for Windsurf users**: Use `serverUrl` instead of `url` in your configuration:
+>
 > ```json
 > {
 >   "mcpServers": {
@@ -187,7 +292,13 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
         "TRANSPORT": "stdio",
         "OPENAI_API_KEY": "your_openai_api_key",
         "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key"
+        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
+        "AWS_ACCESS_KEY_ID": "your_aws_access_key_id",
+        "AWS_SECRET_ACCESS_KEY": "your_aws_secret_access_key",
+        "AWS_REGION": "your_aws_region",
+        "EMBEDDINGS_PROVIDER": "openai", 
+        "CONTEXT_PROVIDER": "openai",
+        "BEDROCK_CONTEXT_MODEL_ID": "anthropic.claude-3-5-sonnet-20240620-v1:0"
       }
     }
   }
@@ -205,24 +316,27 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
                "-e", "TRANSPORT", 
                "-e", "OPENAI_API_KEY", 
                "-e", "SUPABASE_URL", 
-               "-e", "SUPABASE_SERVICE_KEY", 
-               "mcp/crawl4ai"],
+               "-e", "SUPABASE_SERVICE_KEY",
+               "-e", "AWS_ACCESS_KEY_ID",
+               "-e", "AWS_SECRET_ACCESS_KEY",
+               "-e", "AWS_REGION",
+               "-e", "EMBEDDINGS_PROVIDER",
+               "-e", "CONTEXT_PROVIDER",
+               "-e", "BEDROCK_CONTEXT_MODEL_ID",
+               "ignaciocardenas/mcp-crawl4ai-rag-softworks:latest"],
       "env": {
         "TRANSPORT": "stdio",
         "OPENAI_API_KEY": "your_openai_api_key",
         "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key"
+        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
+        "AWS_ACCESS_KEY_ID": "your_aws_access_key_id",
+        "AWS_SECRET_ACCESS_KEY": "your_aws_secret_access_key",
+        "AWS_REGION": "your_aws_region",
+        "EMBEDDINGS_PROVIDER": "openai",
+        "CONTEXT_PROVIDER": "openai",
+        "BEDROCK_CONTEXT_MODEL_ID": "anthropic.claude-3-5-sonnet-20240620-v1:0"
       }
     }
   }
 }
 ```
-
-## Building Your Own Server
-
-This implementation provides a foundation for building more complex MCP servers with web crawling capabilities. To build your own:
-
-1. Add your own tools by creating methods with the `@mcp.tool()` decorator
-2. Create your own lifespan function to add your own dependencies
-3. Modify the `utils.py` file for any helper functions you need
-4. Extend the crawling capabilities by adding more specialized crawlers
