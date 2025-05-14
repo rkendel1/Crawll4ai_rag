@@ -17,7 +17,7 @@ import os
 import re
 import logging
 
-from utils import get_supabase_client, add_documents_to_supabase, search_documents
+from utils import get_supabase_client, add_documents_to_supabase, search_documents, extract_text_from_pdf, load_csv, load_excel
 from mcp.server.fastmcp import FastMCP, Context  # Changed C to Context
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 from dotenv import load_dotenv
@@ -78,35 +78,6 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         await crawler.__aexit__(None, None, None)
 
 # Initialize FastMCP server
-
-# # Determine transport mode and settings
-# transport_env = os.getenv("TRANSPORT", "sse").lower()  # Default to sse if not set or empty
-# actual_host: Optional[str] = None
-# actual_port: Optional[int] = None
-# port_str: Optional[str] = None  # Initialize port_str
-
-# if transport_env == "sse":
-#     actual_host = os.getenv("HOST", "0.0.0.0")  # Default host for sse
-#     port_str = os.getenv("PORT", "8051")  # Default port for sse
-#     try:
-#         actual_port = int(port_str)
-#     except ValueError:
-#         logger.warning(f"PORT environment variable ('{port_str}') is not a valid integer. Defaulting to 8051.")
-#         actual_port = 8051
-# elif transport_env == "stdio":
-#     # For stdio, host and port should be None, FastMCP handles this.
-#     actual_host = None
-#     actual_port = None
-# else:
-#     logger.warning(f"Invalid TRANSPORT mode '{transport_env}'. Defaulting to 'sse'.")
-#     transport_env = "sse"  # Explicitly set to sse for fallback
-#     actual_host = os.getenv("HOST", "0.0.0.0")
-#     port_str = os.getenv("PORT", "8051")
-#     try:
-#         actual_port = int(port_str)
-#     except ValueError:
-#         logger.warning(f"PORT environment variable ('{port_str}') is not a valid integer. Defaulting to 8051.")
-#         actual_port = 8051
 
 mcp = FastMCP(
     "mcp-crawl4ai-rag-softworks",
@@ -644,6 +615,87 @@ async def perform_rag_query(ctx: Context, query: str, source: Optional[str] = No
             "query": query,
             "error": str(e)
         }, indent=2)
+
+
+# New MCP tools for file ingestion
+@mcp.tool()
+async def ingest_pdf(ctx: Context, file_path: str, chunk_size: int = 5000, overlap: int = 200) -> str:
+    """
+    Ingest a PDF file: extract text, split into chunks, embed, and store in Supabase.
+    Args:
+        ctx: MCP context
+        file_path: Local path to the PDF file
+        chunk_size: Maximum characters per chunk
+        overlap: Overlap between chunks
+    Returns:
+        JSON summary of ingestion
+    """
+    supabase_client = ctx.request_context.lifespan_context.supabase_client
+    text = extract_text_from_pdf(file_path)
+    chunks = smart_chunk_markdown(text, chunk_size=chunk_size, overlap=overlap)
+    urls = [file_path] * len(chunks)
+    chunk_numbers = list(range(len(chunks)))
+    contents = chunks
+    metadatas = [
+        {"chunk_index": i, "source": "pdf", "file_path": file_path, "chunk_size": len(c)}
+        for i, c in enumerate(chunks)
+    ]
+    url_to_full_document = {file_path: text}
+    add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+    return json.dumps({"success": True, "file": file_path, "chunks": len(chunks)}, indent=2)
+
+@mcp.tool()
+async def ingest_csv(ctx: Context, file_path: str, chunk_size: int = 5000, overlap: int = 200) -> str:
+    """
+    Ingest a CSV file: load content, split into chunks, embed, and store in Supabase.
+    Args:
+        ctx: MCP context
+        file_path: Local path to the CSV file
+        chunk_size: Maximum characters per chunk
+        overlap: Overlap between chunks
+    Returns:
+        JSON summary of ingestion
+    """
+    supabase_client = ctx.request_context.lifespan_context.supabase_client
+    text = load_csv(file_path)
+    chunks = smart_chunk_markdown(text, chunk_size=chunk_size, overlap=overlap)
+    urls = [file_path] * len(chunks)
+    chunk_numbers = list(range(len(chunks)))
+    contents = chunks
+    metadatas = [
+        {"chunk_index": i, "source": "csv", "file_path": file_path, "chunk_size": len(c)}
+        for i, c in enumerate(chunks)
+    ]
+    url_to_full_document = {file_path: text}
+    add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+    return json.dumps({"success": True, "file": file_path, "chunks": len(chunks)}, indent=2)
+
+@mcp.tool()
+async def ingest_excel(ctx: Context, file_path: str, sheet_name: Optional[str] = None, chunk_size: int = 5000, overlap: int = 200) -> str:
+    """
+    Ingest an Excel file: load specified or all sheets, split into chunks, embed, and store in Supabase.
+    Args:
+        ctx: MCP context
+        file_path: Local path to the Excel file
+        sheet_name: Optional sheet to load; if None, all sheets
+        chunk_size: Maximum characters per chunk
+        overlap: Overlap between chunks
+    Returns:
+        JSON summary of ingestion
+    """
+    supabase_client = ctx.request_context.lifespan_context.supabase_client
+    text = load_excel(file_path, sheet_name)
+    chunks = smart_chunk_markdown(text, chunk_size=chunk_size, overlap=overlap)
+    urls = [file_path] * len(chunks)
+    chunk_numbers = list(range(len(chunks)))
+    contents = chunks
+    metadatas = [
+        {"chunk_index": i, "source": "excel", "file_path": file_path, "chunk_size": len(c)}
+        for i, c in enumerate(chunks)
+    ]
+    url_to_full_document = {file_path: text}
+    add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+    return json.dumps({"success": True, "file": file_path, "sheets": sheet_name or "all", "chunks": len(chunks)}, indent=2)
 
 
 async def main():

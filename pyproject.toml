@@ -12,4 +12,10 @@ dependencies = [
     "dotenv==0.9.9",
     "boto3",
     "botocore",
+    "beautifulsoup4",
+    "pandas",
+    "PyPDF2",
+    "pdfplumber",
+    "chardet",
+    "openpyxl",
 ]

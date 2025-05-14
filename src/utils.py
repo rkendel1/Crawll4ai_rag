@@ -8,8 +8,12 @@ import json
 from supabase import create_client, Client
 from urllib.parse import urlparse
 import openai
-from providers.aws_bedrock import create_titan_embeddings_batch, create_titan_embedding, invoke_bedrock_model
+from providers.aws_bedrock import create_titan_embeddings_batch, create_titan_embedding, invoke_bedrock_model  # Re-added Bedrock helpers
 import logging
+import pandas as pd  # Added for CSV/Excel processing
+from PyPDF2 import PdfReader  # Added for PDF processing
+import pdfplumber  # Modern PDF parsing
+import chardet  # Encoding detection for CSV files
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -147,7 +151,8 @@ Please give a short succinct context to situate this chunk within the overall do
                 temperature=0.3,
                 max_tokens=200  # Max tokens for the generated context
             )
-            context = response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            context = content.strip() if content else ""
 
         elif CONTEXT_PROVIDER == "bedrock":
             if not BEDROCK_CONTEXT_MODEL_ID:
@@ -158,14 +163,15 @@ Please give a short succinct context to situate this chunk within the overall do
             logger.info("[CONTEXT] Calling Bedrock model '%s' for context generation in region '%s'.", BEDROCK_CONTEXT_MODEL_ID, region)
             # Call the centralized invoke_bedrock_model function
             # Max tokens here refers to the expected output length for the context.
-            context = invoke_bedrock_model(
+            result = invoke_bedrock_model(
                 model_id=BEDROCK_CONTEXT_MODEL_ID,
                 prompt=prompt,
                 max_tokens=200,  # Max tokens for the generated context
                 temperature=0.3,
                 # top_p is managed by invoke_bedrock_model default or specific model logic
                 region=region
-            ).strip()
+            )
+            context = result.strip() if result else ""
 
         else:
             logger.info("[CONTEXT] Unknown CONTEXT_PROVIDER: %s. Skipping contextual embedding.", CONTEXT_PROVIDER)
@@ -367,3 +373,58 @@ def search_documents(
     except Exception as e:
         print(f"Error searching documents: {e}")
         return []
+
+
+# New utility functions to process PDF, CSV, and Excel files
+def extract_text_from_pdf(file_path: str) -> str:
+    """
+    Extract text from a PDF file.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        The extracted text.
+    """
+    reader = PdfReader(file_path)
+    texts: List[str] = []
+    for page in reader.pages:
+        page_text = page.extract_text()
+        texts.append(page_text if page_text else "")
+    return "\n".join(texts)
+
+def load_csv(file_path: str) -> str:
+    """
+    Load a CSV file and return its content as raw text.
+
+    Args:
+        file_path: Path to the CSV file.
+
+    Returns:
+        CSV content as a string.
+    """
+    df = pd.read_csv(file_path)
+    return df.to_csv(index=False)
+
+def load_excel(file_path: str, sheet_name: Optional[str] = None) -> str:
+    """
+    Load an Excel file and return its content as raw text.
+
+    Args:
+        file_path: Path to the Excel file.
+        sheet_name: Optional sheet name to load. If None, all sheets are loaded.
+
+    Returns:
+        Excel content as a string, with sheet names.
+    """
+    if sheet_name:
+        df = pd.read_excel(file_path, sheet_name=sheet_name)
+        sheets = {sheet_name: df}
+    else:
+        sheets = pd.read_excel(file_path, sheet_name=None)
+
+    texts: List[str] = []
+    for name, frame in sheets.items():
+        text = frame.to_csv(index=False)
+        texts.append(f"Sheet: {name}\n{text}")
+    return "\n\n".join(texts)
