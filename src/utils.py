@@ -124,7 +124,7 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         # Create the prompt for generating contextual information
         # Reduced full_document length to avoid overly long prompts for context generation
         prompt = f"""<document> 
-{full_document[:15000]} 
+{full_document[:25000]} 
 </document>
 Here is the chunk we want to situate within the whole document 
 <chunk> 
@@ -268,7 +268,8 @@ def add_documents_to_supabase(
 
             # Process in parallel using ThreadPoolExecutor
             contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:  # Reduced concurrency to avoid 429 errors
+            max_workers = os.getenv("MAX_WORKERS_FOR_SUPABASE", 1)  # Set max workers for threading
+            with concurrent.futures.ThreadPoolExecutor(max_workers=int(max_workers)) as executor:  # Reduced concurrency to avoid 429 errors
                 # Submit all tasks and collect results
                 future_to_idx = {executor.submit(process_chunk_with_context, arg): idx
                                  for idx, arg in enumerate(process_args)}

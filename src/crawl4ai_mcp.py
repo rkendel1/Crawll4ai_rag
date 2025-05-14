@@ -167,49 +167,50 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
     return urls
 
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
-    chunks = []
-    start = 0
-    text_length = len(text)
-
-    while start < text_length:
-        # Calculate end position
-        end = start + chunk_size
-
-        # If we're at the end of the text, just take what's left
-        if end >= text_length:
-            chunks.append(text[start:].strip())
-            break
-
-        # Try to find a code block boundary first (```)
-        chunk = text[start:end]
-        code_block = chunk.rfind('```')
-        if code_block != -1 and code_block > chunk_size * 0.3:
-            end = start + code_block
-
-        # If no code block, try to break at a paragraph
-        elif '\n\n' in chunk:
-            # Find the last paragraph break
-            last_break = chunk.rfind('\n\n')
-            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_break
-
-        # If no paragraph break, try to break at a sentence
-        elif '. ' in chunk:
-            # Find the last sentence break
-            last_period = chunk.rfind('. ')
-            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_period + 1
-
-        # Extract chunk and clean it up
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move start position for next chunk
-        start = end
-
+def smart_chunk_markdown(text: str, chunk_size: int = 5000, overlap: int = 200) -> List[str]:
+    """Split text into chunks by headings, respecting code blocks, paragraphs, sentences, and adding overlap."""
+    chunks: List[str] = []
+    # First split by level-2 headings to respect logical sections
+    sections = re.split(r'(?m)^(##\s+)', text)
+    # Reconstruct sections preserving headers
+    logical_units = []
+    if len(sections) > 1:
+        for i in range(1, len(sections), 2):
+            header = sections[i]
+            body = sections[i+1] if i+1 < len(sections) else ''
+            logical_units.append(header + body)
+    else:
+        logical_units = [text]
+    # Chunk each logical unit with overlap
+    for unit in logical_units:
+        start = 0
+        length = len(unit)
+        while start < length:
+            end = min(start + chunk_size, length)
+            segment = unit[start:end]
+            # attempt breakpoints inside segment
+            # code block boundary
+            cb = segment.rfind('```')
+            if cb != -1 and cb > chunk_size * 0.3:
+                end = start + cb
+                segment = unit[start:end]
+            # paragraph
+            elif '\n\n' in segment:
+                lb = segment.rfind('\n\n')
+                if lb > chunk_size * 0.3:
+                    end = start + lb
+                    segment = unit[start:end]
+            # sentence
+            elif '. ' in segment:
+                lp = segment.rfind('. ')
+                if lp > chunk_size * 0.3:
+                    end = start + lp + 1
+                    segment = unit[start:end]
+            segment = segment.strip()
+            if segment:
+                chunks.append(segment)
+            # move start with overlap
+            start = end - overlap if end < length else end
     return chunks
 
 
@@ -283,8 +284,14 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                 meta["source"] = urlparse(url).netloc
                 # Handle potential None for current_task or its coroutine
                 current_task = asyncio.current_task()
-                coro_name = current_task.get_coro().__name__ if current_task and hasattr(current_task, 'get_coro') and hasattr(current_task.get_coro(), '__name__') else "unknown_task"
-                meta["crawl_time"] = coro_name
+                coro = None
+                if current_task and hasattr(current_task, 'get_coro'):
+                    try:
+                        coro = current_task.get_coro()
+                    except:
+                        coro = None
+                meta_name = getattr(coro, '__name__', 'unknown_task')
+                meta["crawl_time"] = meta_name
                 metadatas.append(meta)
 
             # Create url_to_full_document mapping
@@ -376,48 +383,43 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "error": "No content found"
             }, indent=2)
 
-        # Process results and store in Supabase
-        urls = []
-        chunk_numbers = []
-        contents = []
-        metadatas = []
+        # Process results and store in Supabase incrementally
+        # Define batch size for incremental inserts
+        batch_size = 20
         chunk_count = 0
 
         for doc in crawl_results:
             source_url = doc['url']
             md = doc['markdown']
             chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
-
+            # prepare batch data per document
+            urls = [source_url] * len(chunks)
+            chunk_numbers = list(range(len(chunks)))
+            contents = chunks
+            metadatas = []
             for i, chunk in enumerate(chunks):
-                urls.append(source_url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
-
-                # Extract metadata
                 meta = extract_section_info(chunk)
                 meta["chunk_index"] = i
                 meta["url"] = source_url
                 meta["source"] = urlparse(source_url).netloc
                 meta["crawl_type"] = crawl_type
-                # Handle potential None for current_task or its coroutine
+                # Safe extraction of coroutine name
                 current_task = asyncio.current_task()
-                coro_name = current_task.get_coro().__name__ if current_task and hasattr(current_task, 'get_coro') and hasattr(current_task.get_coro(), '__name__') else "unknown_task"
-                meta["crawl_time"] = coro_name
+                coro = None
+                if current_task and hasattr(current_task, 'get_coro'):
+                    try:
+                        coro = current_task.get_coro()
+                    except:
+                        coro = None
+                meta_name = getattr(coro, '__name__', 'unknown_task')
+                meta["crawl_time"] = meta_name
                 metadatas.append(meta)
+            # insert this document's chunks right away
+            url_to_full_document = {source_url: md}
+            add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+            chunk_count += len(chunks)
 
-                chunk_count += 1
-
-        # Create url_to_full_document mapping
-        url_to_full_document = {}
-        for doc in crawl_results:
-            url_to_full_document[doc['url']] = doc['markdown']
-
-        # Add to Supabase
-        # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
-        batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers,
-                                  contents, metadatas, url_to_full_document, batch_size=batch_size)
-
+        # Finished incremental upload of all pages
         return json.dumps({
             "success": True,
             "url": url,
