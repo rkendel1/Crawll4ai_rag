@@ -4,9 +4,13 @@ from json import JSONDecodeError  # Added JSONDecodeError
 from typing import List, Optional, Any, Dict
 import logging
 import boto3
-from botocore.exceptions import ClientError
+import time  # Added for sleep
+import random  # Added for jitter
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError, BotoCoreError
+
+logger = logging.getLogger(__name__)  # Standard logger
+
 _bedrock_client = None
-logger = logging.getLogger(__name__)
 
 
 def get_bedrock_client(region: Optional[str] = None):
@@ -80,7 +84,7 @@ def invoke_bedrock_model(
     temperature: float = 0.7,
     top_p: float = 0.9,
     region: Optional[str] = None
-) -> str:
+) -> Optional[str]:
     """
     Invokes the AWS Bedrock model (Claude or DeepSeek) for text generation.
     Args:
@@ -91,137 +95,129 @@ def invoke_bedrock_model(
         top_p: Controls nucleus sampling.
         region: AWS region (optional).
     Returns:
-        The generated text from the model.
-    Raises:
-        ValueError: If the model_id is not a supported model or an API error occurs.
+        The generated text from the model or None if an error occurs.
     """
     client = get_bedrock_client(region)
 
-    # Use Claude as default for Bedrock
-    if model_id.startswith("anthropic.claude"):
-        request_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-        content_type = "application/json"
-        accept = "application/json"
-        def extract_claude_response(r: Dict[str, Any]) -> Optional[str]:
-            if r.get("content"):
-                return r["content"]
-            if r.get("completion"):
-                return r["completion"]
-            return None
-        response_body_raw_bytes = None
+    max_retries = 5
+    base_delay = 1  # seconds
+    max_delay = 60  # seconds
+
+    for attempt in range(max_retries):
+        response_obj = None  # Initialize response_obj at the start of each retry attempt
         try:
-            response = client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(request_body),
-                accept=accept,
-                contentType=content_type
-            )
-            response_body_raw_bytes = response.get("body").read()
-            if not response_body_raw_bytes:
-                raise ValueError(f"Received empty response body from model {model_id}.")
-            response_body = json.loads(response_body_raw_bytes.decode('utf-8'))
-            generated_text = extract_claude_response(response_body)
-            if generated_text is None:
-                raise ValueError(f"Failed to parse or extract generated text from model {model_id}. Response body: {response_body}")
-            return generated_text
-        except Exception as e:
-            logger.error("Error invoking Bedrock Claude model %s: %s", model_id, e, exc_info=True)
-            if response_body_raw_bytes is not None:
-                logger.error("Raw response body from %s: %s", model_id, response_body_raw_bytes.decode('utf-8', errors='ignore'))
-            raise ValueError(f"Error invoking Bedrock Claude model {model_id}: {e}") from e
-    # Fallback: DeepSeek or other models (legacy)
-    elif model_id.startswith("deepseek"):
-        client = get_bedrock_client(region)
-
-        # Ensure only deepseek models are processed
-        if not model_id.startswith("deepseek"):  # Check for "deepseek" prefix.
-            error_msg = f"Unsupported model_id: {model_id}. This function is exclusively for DeepSeek models (e.g., deepseek.r1-v1:0)."
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        # Payload for deepseek models
-        request_body: Dict[str, Any] = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
+            if model_id.startswith("anthropic.claude"):
+                request_body = {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
                 }
-            ],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-        }
+                content_type = "application/json"
+                accept = "application/json"
 
-        # Response parsing for deepseek models
-        def parsed_response_extractor(r: Dict[str, Any]) -> Optional[str]:
-            if r.get("choices") and isinstance(r.get("choices"), list) and len(r["choices"]) > 0:
-                message = r["choices"][0].get("message")
-                if message and message.get("role") == "assistant":
-                    return message.get("content")
+                response_obj = client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(request_body),
+                    accept=accept,
+                    contentType=content_type
+                )
+                response_body_raw_bytes = response_obj.get("body").read()
+                if not response_body_raw_bytes:
+                    raise ValueError(
+                        f"Received empty response body from model {model_id}.")
+                response_body = json.loads(
+                    response_body_raw_bytes.decode('utf-8'))
+                generated_text = response_body.get("content") or response_body.get("completion")
+                if generated_text is None:
+                    raise ValueError(
+                        f"Failed to parse or extract generated text from model {model_id}. Response body: {response_body}")
+                return generated_text
+
+            elif model_id.startswith("deepseek"):
+                request_body = {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                }
+
+                response_obj = client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(request_body),
+                    accept="application/json",
+                    contentType="application/json"
+                )
+                response_body_raw_bytes = response_obj.get("body").read()
+                if not response_body_raw_bytes:
+                    raise ValueError(
+                        f"Received empty response body from model {model_id}.")
+                response_body = json.loads(
+                    response_body_raw_bytes.decode('utf-8'))
+                choices = response_body.get("choices")
+                if choices and isinstance(choices, list) and len(choices) > 0:
+                    message = choices[0].get("message")
+                    if message and message.get("role") == "assistant":
+                        return message.get("content")
+                raise ValueError(
+                    f"Failed to parse or extract generated text from model {model_id}. Response body: {response_body}")
+
+            else:
+                raise ValueError(f"Unsupported model_id: {model_id}. Only Claude and DeepSeek are supported.")
+
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ThrottlingException':
+                if attempt < max_retries - 1:
+                    delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
+                    logger.warning(
+                        f"ThrottlingException encountered for model {model_id}. Retrying in {delay:.2f} seconds (attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        f"Max retries reached for model {model_id} due to ThrottlingException. Last error: {e}")
+                    return None
+            elif e.response['Error']['Code'] == 'AccessDeniedException':
+                logger.error(
+                    f"AccessDeniedException when invoking Bedrock model {model_id}. Check IAM permissions. Error: {e}")
+                return None
+            else:
+                logger.error(
+                    f"ClientError when invoking Bedrock model {model_id}: {e}")
+                if response_obj and hasattr(response_obj.get("body"), "read"):
+                    error_response_body = response_obj.get("body").read().decode('utf-8', errors='ignore')
+                    logger.error(f"Error response body from Bedrock: {error_response_body}")
+                return None
+        except BotoCoreError as e:
             logger.error(
-                "Could not parse or find content in response from DeepSeek model '%s': %s", model_id, r)
+                f"BotoCoreError when invoking Bedrock model {model_id}: {e}")
+            if attempt < max_retries - 1:
+                delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
+                logger.warning(
+                    f"BotoCoreError encountered. Retrying in {delay:.2f} seconds (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Max retries reached for model {model_id} due to BotoCoreError. Last error: {e}")
+                return None
+        except NoCredentialsError:
+            logger.error(f"No AWS credentials found. Please configure them.")
+            return None
+        except PartialCredentialsError:
+            logger.error(f"Incomplete AWS credentials. Please check your configuration.")
+            return None
+        except Exception as e:
+            logger.error(
+                f"Unexpected error invoking Bedrock model {model_id}: {e}")
+            if response_obj and hasattr(response_obj.get("body"), "read"):
+                error_response_body = response_obj.get("body").read().decode('utf-8', errors='ignore')
+                logger.error(f"Error response body (if any) during unexpected error: {error_response_body}")
             return None
 
-        response_body_raw_bytes: Optional[bytes] = None
-        try:
-            response = client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(request_body),
-                accept="application/json",
-                contentType="application/json"
-            )
-            response_body_raw_bytes = response.get("body").read()
-            if not response_body_raw_bytes:
-                err_msg = f"Received empty response body from model {model_id}."
-                logger.error(err_msg)
-                raise ValueError(err_msg)
-
-            response_body = json.loads(response_body_raw_bytes.decode(
-                'utf-8'))  # Decode bytes to string before parsing
-            generated_text = parsed_response_extractor(response_body)
-
-            if generated_text is None:
-                err_msg = f"Failed to parse or extract generated text from model {model_id}. Response body: {response_body}"
-                logger.error(err_msg)
-                raise ValueError(err_msg)
-            return generated_text
-
-        except ClientError as ce:
-            logger.error("AWS ClientError invoking Bedrock model %s: %s",
-                         model_id, ce, exc_info=True)
-            logger.error("Request body sent to %s: %s",
-                         model_id, json.dumps(request_body))
-            if response_body_raw_bytes is not None:
-                logger.error("Raw response body from %s: %s", model_id,
-                             response_body_raw_bytes.decode('utf-8', errors='ignore'))
-            raise ValueError(
-                f"AWS ClientError invoking Bedrock model {model_id}: {ce}") from ce
-        except JSONDecodeError as jde:
-            logger.error("JSONDecodeError invoking Bedrock model %s: %s",
-                         model_id, jde, exc_info=True)
-            logger.error("Request body sent to %s: %s",
-                         model_id, json.dumps(request_body))
-            if response_body_raw_bytes is not None:
-                logger.error("Raw response body from %s: %s", model_id,
-                             response_body_raw_bytes.decode('utf-8', errors='ignore'))
-            raise ValueError(
-                f"JSONDecodeError invoking Bedrock model {model_id}: {jde}") from jde
-        except Exception as e:
-            logger.error("General error invoking Bedrock model %s: %s",
-                         model_id, e, exc_info=True)
-            logger.error("Request body sent to %s: %s",
-                         model_id, json.dumps(request_body))
-            if response_body_raw_bytes is not None:
-                logger.error("Raw response body from %s: %s", model_id,
-                             response_body_raw_bytes.decode('utf-8', errors='ignore'))
-            raise ValueError(
-                f"Error invoking Bedrock model {model_id}: {e}") from e
-    else:
-        raise ValueError(f"Unsupported model_id: {model_id}. Only Claude and DeepSeek are supported.")
+    return None

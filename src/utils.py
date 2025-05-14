@@ -268,7 +268,7 @@ def add_documents_to_supabase(
 
             # Process in parallel using ThreadPoolExecutor
             contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:  # Reduced concurrency to avoid 429 errors
                 # Submit all tasks and collect results
                 future_to_idx = {executor.submit(process_chunk_with_context, arg): idx
                                  for idx, arg in enumerate(process_args)}
