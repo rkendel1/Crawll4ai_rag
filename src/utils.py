@@ -14,6 +14,7 @@ import pandas as pd  # Added for CSV/Excel processing
 from PyPDF2 import PdfReader  # Added for PDF processing
 import pdfplumber  # Modern PDF parsing
 import chardet  # Encoding detection for CSV files
+import re
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -171,7 +172,14 @@ Please give a short succinct context to situate this chunk within the overall do
                 # top_p is managed by invoke_bedrock_model default or specific model logic
                 region=region
             )
-            context = result.strip() if result else ""
+            # Asegurar que el resultado es string antes de llamar .strip()
+            if isinstance(result, list):
+                # Si es lista, tomar el primer string no vacío
+                context = next((str(x).strip() for x in result if isinstance(x, str) and x.strip()), "")
+            elif isinstance(result, str):
+                context = result.strip()
+            else:
+                context = ""
 
         else:
             logger.info("[CONTEXT] Unknown CONTEXT_PROVIDER: %s. Skipping contextual embedding.", CONTEXT_PROVIDER)
@@ -428,3 +436,20 @@ def load_excel(file_path: str, sheet_name: Optional[str] = None) -> str:
         text = frame.to_csv(index=False)
         texts.append(f"Sheet: {name}\n{text}")
     return "\n\n".join(texts)
+
+def strip_link_only_lines(text: str) -> str:
+    """
+    Remove lines that contain only a Markdown link or a bare URL.
+
+    Args:
+        text: Input text to clean
+
+    Returns:
+        Cleaned text with link-only lines removed
+    """
+    # Pattern matches lines that are just [text](url) or http(s) URLs
+    return re.sub(
+        r'(?m)^\s*(?:\[[^\]]+\]\([^)]+\)|https?://\S+)\s*$',
+        '',
+        text
+    )

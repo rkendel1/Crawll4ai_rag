@@ -17,7 +17,7 @@ import os
 import re
 import logging
 
-from utils import get_supabase_client, add_documents_to_supabase, search_documents, extract_text_from_pdf, load_csv, load_excel
+from utils import get_supabase_client, add_documents_to_supabase, search_documents, extract_text_from_pdf, load_csv, load_excel, strip_link_only_lines
 from mcp.server.fastmcp import FastMCP, Context  # Changed C to Context
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 from dotenv import load_dotenv
@@ -234,8 +234,11 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         result = await crawler.arun(url=url, config=run_config)
 
         if result.success and result.markdown:
-            # Chunk the content
-            chunks = smart_chunk_markdown(result.markdown)
+            # Pre-procesado: eliminar líneas que solo contienen enlaces
+            raw_md = result.markdown
+            clean_md = strip_link_only_lines(raw_md)
+            # Chunk the cleaned content
+            chunks = smart_chunk_markdown(clean_md)
 
             # Prepare data for Supabase
             urls = []
@@ -361,8 +364,11 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
 
         for doc in crawl_results:
             source_url = doc['url']
-            md = doc['markdown']
-            chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+            # Pre-procesado: eliminar líneas de enlaces repetidos
+            raw_md = doc['markdown']
+            clean_md = strip_link_only_lines(raw_md)
+            # Chunk the cleaned markdown
+            chunks = smart_chunk_markdown(clean_md, chunk_size=chunk_size)
             # prepare batch data per document
             urls = [source_url] * len(chunks)
             chunk_numbers = list(range(len(chunks)))
@@ -386,7 +392,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 meta["crawl_time"] = meta_name
                 metadatas.append(meta)
             # insert this document's chunks right away
-            url_to_full_document = {source_url: md}
+            url_to_full_document = {source_url: raw_md}
             add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
             chunk_count += len(chunks)
 
