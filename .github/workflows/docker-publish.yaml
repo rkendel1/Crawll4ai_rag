@@ -43,4 +43,5 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ignaciocardenas/mcp-crawl4ai-rag-softworks:${{ steps.extract_tag.outputs.tag }}
