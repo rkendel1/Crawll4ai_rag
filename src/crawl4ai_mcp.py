@@ -19,9 +19,12 @@ import asyncio
 import json
 import os
 import re
+import math
+from collections import Counter
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-from utils import get_supabase_client, add_documents_to_supabase, search_documents
+# Updated utils import to include expand_query_with_llm and rerank_retrieved_documents
+from utils import get_supabase_client, add_documents_to_supabase, search_documents, expand_query_with_llm, rerank_retrieved_documents
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -180,11 +183,69 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
     Returns:
         Dictionary with headers and stats
     """
-    headers = re.findall(r'^(#+)\s+(.+)$', chunk, re.MULTILINE)
-    header_str = '; '.join([f'{h[0]} {h[1]}' for h in headers]) if headers else ''
+    # Keyword extraction parameters
+    TOP_N_KEYWORDS = 5
+    # Basic stop words list (can be expanded)
+    STOP_WORDS = set([
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "should",
+        "can", "could", "may", "might", "must", "and", "or", "but", "if",
+        "then", "else", "when", "where", "why", "how", "all", "any", "both",
+        "each", "few", "more", "most", "other", "some", "such", "no", "nor",
+        "not", "only", "own", "same", "so", "than", "too", "very", "s", "t",
+        "just", "don", "now", "in", "on", "at", "by", "for", "with", "about",
+        "against", "between", "into", "through", "during", "before", "after",
+        "above", "below", "to", "from", "up", "down", "out", "off", "over",
+        "under", "again", "further", "then", "once", "here", "there", "when",
+        "where", "why", "how", "all", "any", "both", "each", "few", "more",
+        "most", "other", "some", "such", "no", "nor", "not", "only", "own",
+        "same", "so", "than", "too", "very"
+    ])
+
+    # Hierarchical header extraction
+    headers = []
+    current_header_path = []
+    header_levels = [0] * 6  # For H1 to H6
+
+    # Legacy header string (optional, can be removed if not needed for backward compatibility)
+    legacy_headers_list = []
+
+    lines = chunk.split('\n')
+    for line in lines:
+        match = re.match(r'^(#+)\s+(.+)$', line)
+        if match:
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            legacy_headers_list.append(f'{match.group(1)} {title}')
+
+            # Update header_levels for current and higher levels
+            header_levels[level - 1] = title
+            for i in range(level, 6):
+                header_levels[i] = None  # Reset deeper levels
+
+            # Construct current path
+            current_path_parts = [h for h in header_levels[:level] if h]
+            if current_path_parts:
+                headers.append(" > ".join(current_path_parts))
+
+    header_str = '; '.join(legacy_headers_list) if legacy_headers_list else ''
+
+    # Keyword Extraction (TF-based)
+    words = re.findall(r'\b\w+\b', chunk.lower())
+    # Filter out stop words and non-alphabetic tokens
+    filtered_words = [word for word in words if word.isalpha() and word not in STOP_WORDS and len(word) > 2]
+    
+    keywords = []
+    if filtered_words:
+        term_frequency = Counter(filtered_words)
+        # Get top N keywords
+        top_keywords = term_frequency.most_common(TOP_N_KEYWORDS)
+        keywords = [kw[0] for kw in top_keywords]
 
     return {
-        "headers": header_str,
+        "headers": header_str,  # Legacy format for compatibility
+        "header_path": headers if headers else None, # New hierarchical format
+        "keywords": keywords if keywords else None, # New keywords
         "char_count": len(chunk),
         "word_count": len(chunk.split())
     }
@@ -543,41 +604,83 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     try:
         # Get the Supabase client from the context
         supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
+        model_choice = os.getenv("MODEL_CHOICE")
+
+        all_queries = [query] # Start with the original query
+
+        if model_choice and model_choice.strip():
+            print(f"Attempting to expand query using LLM: {model_choice}")
+            expanded_queries = await expand_query_with_llm(query, model_choice)
+            if expanded_queries:
+                print(f"Expanded queries: {expanded_queries}")
+                all_queries.extend(expanded_queries)
+            else:
+                print("Query expansion did not return any new queries or failed.")
+        else:
+            print("MODEL_CHOICE not set, skipping query expansion.")
+
         # Prepare filter if source is provided and not empty
         filter_metadata = None
         if source and source.strip():
             filter_metadata = {"source": source}
         
-        # Perform the search
+        # Perform the search using all queries (original + expanded)
         results = search_documents(
             client=supabase_client,
-            query=query,
+            queries=all_queries, # Pass list of queries
             match_count=match_count,
             filter_metadata=filter_metadata
         )
         
+        # Re-ranking step
+        reranking_applied = False
+        reranker_model_env = os.getenv("RERANKER_MODEL_CHOICE")
+        openai_api_key = os.getenv("OPENAI_API_KEY") # Already loaded, but good to check availability for this step
+        
+        actual_reranker_model = reranker_model_env if reranker_model_env else model_choice # Fallback to MODEL_CHOICE
+
+        if actual_reranker_model and openai_api_key and results:
+            print(f"Attempting to rerank {len(results)} documents using model: {actual_reranker_model}")
+            results = await rerank_retrieved_documents(
+                original_query=query, # Use the initial original query for reranking context
+                documents=results,
+                reranker_model_choice=actual_reranker_model
+            )
+            reranking_applied = True
+            print("Reranking completed.")
+        elif not results:
+            print("No results from search_documents to rerank.")
+        else:
+            print(f"Skipping reranking. Reranker Model: '{actual_reranker_model}', API Key Available: {bool(openai_api_key)}")
+
         # Format the results
+        # The 'results' variable now contains potentially reranked and scored documents
         formatted_results = []
-        for result in results:
-            formatted_results.append({
-                "url": result.get("url"),
-                "content": result.get("content"),
-                "metadata": result.get("metadata"),
-                "similarity": result.get("similarity")
-            })
+        for result_doc in results: # Changed variable name to avoid conflict
+            doc_data = {
+                "url": result_doc.get("url"),
+                "content": result_doc.get("content"), # Content is already part of the document
+                "metadata": result_doc.get("metadata"),
+                "similarity": result_doc.get("similarity") # Original similarity from vector search
+            }
+            if "relevance_score" in result_doc:
+                doc_data["relevance_score"] = result_doc.get("relevance_score")
+            formatted_results.append(doc_data)
         
         return json.dumps({
             "success": True,
-            "query": query,
+            "original_query": query,
+            "queries_used": all_queries,
             "source_filter": source,
+            "reranking_applied": reranking_applied,
             "results": formatted_results,
             "count": len(formatted_results)
         }, indent=2)
     except Exception as e:
+        # Ensure error response also includes original_query for consistency
         return json.dumps({
             "success": False,
-            "query": query,
+            "original_query": query, # Add original_query here as well
             "error": str(e)
         }, indent=2)
 
