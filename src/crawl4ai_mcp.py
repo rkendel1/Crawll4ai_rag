@@ -76,7 +76,7 @@ mcp = FastMCP(
     description="MCP server for RAG and web crawling with Crawl4AI",
     lifespan=crawl4ai_lifespan,
     host=os.getenv("HOST", "0.0.0.0"),
-    port=os.getenv("PORT", "8051")
+    port=int(os.getenv("PORT", "8051"))
 )
 
 def is_sitemap(url: str) -> bool:
@@ -206,8 +206,8 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     """
     try:
         # Get the crawler from the context
-        crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        crawler = ctx.session.lifespan_context.crawler
+        supabase_client = ctx.session.lifespan_context.supabase_client
         
         # Configure the crawl
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
@@ -291,8 +291,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
     """
     try:
         # Get the crawler and Supabase client from the context
-        crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        crawler = ctx.session.lifespan_context.crawler
+        supabase_client = ctx.session.lifespan_context.supabase_client
         
         crawl_results = []
         crawl_type = "webpage"
@@ -487,7 +487,7 @@ async def get_available_sources(ctx: Context) -> str:
     """
     try:
         # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        supabase_client = ctx.session.lifespan_context.supabase_client
         
         # Use a direct query with the Supabase client
         # This could be more efficient with a direct Postgres query but
@@ -542,7 +542,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
     """
     try:
         # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        supabase_client = ctx.session.lifespan_context.supabase_client
         
         # Prepare filter if source is provided and not empty
         filter_metadata = None
@@ -582,7 +582,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         }, indent=2)
 
 async def main():
-    transport = os.getenv("TRANSPORT", "sse")
+    transport = os.getenv("TRANSPORT", "stdio")
     if transport == 'sse':
         # Run the MCP server with sse transport
         await mcp.run_sse_async()
