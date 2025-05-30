@@ -5,12 +5,18 @@ import os
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import json
+import asyncio # Added for asyncio.to_thread if needed, and for async functions
 from supabase import create_client, Client
 from urllib.parse import urlparse
 import openai
+from openai import AsyncOpenAI # For async LLM calls
 
-# Load OpenAI API key for embeddings
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Initialize OpenAI clients
+# Synchronous client for existing functions (embeddings, contextual_embedding)
+openai.api_key = os.getenv("OPENAI_API_KEY") 
+# Asynchronous client for new query expansion function
+# Ensure OPENAI_API_KEY is loaded before this
+aclient = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def get_supabase_client() -> Client:
     """
@@ -117,6 +123,83 @@ Please give a short succinct context to situate this chunk within the overall do
     except Exception as e:
         print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
         return chunk, False
+
+async def expand_query_with_llm(original_query: str, model_choice: str) -> List[str]:
+    """
+    Expand the original query with LLM-generated alternative formulations.
+    Returns a list of expanded queries, or an empty list if failed.
+    """
+    if not model_choice or not original_query:
+        return []
+
+    prompt = f"""Given the following user query for information retrieval:
+"{original_query}"
+
+Please generate 2-3 alternative formulations or related questions that would be helpful for retrieving a broader set of relevant documents.
+Return your answer as a JSON list of strings. For example:
+["alternative query 1", "related question 2"]
+Return only the JSON list and nothing else.
+"""
+    try:
+        response = await aclient.chat.completions.create(
+            model=model_choice,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that expands user queries for information retrieval. You must respond with only a valid JSON list of strings."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=150,
+            response_format={"type": "json_object"} # Ensure JSON output
+        )
+        content = response.choices[0].message.content
+        if content:
+            # The response_format="json_object" should ensure it's a JSON object,
+            # but the prompt asks for a list. Let's assume the LLM might wrap it in a key.
+            # Or it might return a JSON string that is a list.
+            try:
+                # Attempt to parse the entire content as a JSON list
+                expanded_queries = json.loads(content)
+                if isinstance(expanded_queries, list) and all(isinstance(q, str) for q in expanded_queries):
+                    return expanded_queries
+                # If it's a dict, look for a key that contains a list of strings
+                elif isinstance(expanded_queries, dict):
+                    for key, value in expanded_queries.items():
+                        if isinstance(value, list) and all(isinstance(q, str) for q in value):
+                            return value
+                print(f"LLM returned JSON, but not in the expected list format: {content}")
+                return []
+            except json.JSONDecodeError:
+                # Fallback for cases where LLM doesn't strictly adhere to JSON list,
+                # e.g. if it returns newline-separated strings despite the prompt.
+                # This is less ideal if JSON was expected.
+                # Given response_format="json_object", this fallback might be less necessary.
+                cleaned_content = content.strip().replace("```json", "").replace("```", "").strip()
+                if cleaned_content.startswith('[') and cleaned_content.endswith(']'):
+                    try:
+                        expanded_queries = json.loads(cleaned_content)
+                        if isinstance(expanded_queries, list) and all(isinstance(q, str) for q in expanded_queries):
+                            return expanded_queries
+                    except json.JSONDecodeError:
+                        print(f"Failed to parse LLM response as JSON list after cleaning: {cleaned_content}")
+                        pass # Fall through to trying newline separation if robust parsing fails
+
+                # As a last resort, try splitting by newlines if it's not a JSON list
+                # This is a weaker fallback.
+                if not (cleaned_content.startswith('[') and cleaned_content.endswith(']')):
+                    queries = [q.strip() for q in cleaned_content.split('\n') if q.strip()]
+                    # Filter out any potential non-query lines if the LLM added extra text
+                    # (though it was instructed not to)
+                    # A simple heuristic: queries are usually not extremely short or long.
+                    queries = [q for q in queries if 2 < len(q.split()) < 20 and 'query' not in q.lower() and 'question' not in q.lower()]
+                    if queries:
+                        return queries
+                
+                print(f"Could not parse LLM response for query expansion: {content}")
+                return []
+        return []
+    except Exception as e:
+        print(f"Error calling LLM for query expansion: {e}")
+        return []
 
 def process_chunk_with_context(args):
     """
@@ -255,41 +338,186 @@ def add_documents_to_supabase(
             print(f"Error inserting batch into Supabase: {e}")
 
 def search_documents(
-    client: Client, 
-    query: str, 
-    match_count: int = 10, 
+    client: Client,
+    queries: List[str], # Changed from query: str
+    match_count: int = 10,
     filter_metadata: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for documents in Supabase using vector similarity.
+    Search for documents in Supabase using vector similarity for multiple queries.
+    Consolidates and de-duplicates results.
     
     Args:
         client: Supabase client
-        query: Query text
-        match_count: Maximum number of results to return
+        queries: List of query texts (original + expanded)
+        match_count: Maximum number of results to return in the final list
         filter_metadata: Optional metadata filter
         
     Returns:
-        List of matching documents
+        Consolidated list of matching documents
     """
-    # Create embedding for the query
-    query_embedding = create_embedding(query)
-    
-    # Execute the search using the match_crawled_pages function
-    try:
-        # Only include filter parameter if filter_metadata is provided and not empty
-        params = {
-            'query_embedding': query_embedding,
-            'match_count': match_count
-        }
-        
-        # Only add the filter if it's actually provided and not empty
-        if filter_metadata:
-            params['filter'] = filter_metadata  # Pass the dictionary directly, not JSON-encoded
-        
-        result = client.rpc('match_crawled_pages', params).execute()
-        
-        return result.data
-    except Exception as e:
-        print(f"Error searching documents: {e}")
+    if not queries:
         return []
+
+    all_embeddings = create_embeddings_batch(queries)
+    if not all_embeddings or len(all_embeddings) != len(queries):
+        # Fallback to original query if batch embedding fails for some reason
+        if queries:
+             single_embedding = create_embedding(queries[0])
+             if single_embedding and any(v != 0.0 for v in single_embedding): # Check if not empty embedding
+                 all_embeddings = [single_embedding]
+             else:
+                 print("Failed to create embeddings for any query.")
+                 return []
+        else: # Should not happen if initial check `if not queries:` passes
+            return []
+            
+    all_results = []
+    # Determine how many results to fetch per query.
+    # A simple approach: fetch match_count for the primary query,
+    # and fewer for expanded queries to control total results before deduplication.
+    # Or, fetch match_count for all and rely on deduplication and final trim.
+    # For now, let's fetch match_count for each to maximize chances of finding relevant docs.
+    
+    for i, query_embedding in enumerate(all_embeddings):
+        # Skip if embedding is effectively empty (all zeros)
+        if not any(v != 0.0 for v in query_embedding):
+            print(f"Skipping query '{queries[i]}' due to empty embedding.")
+            continue
+
+        try:
+            params = {
+                'query_embedding': query_embedding,
+                'match_count': match_count # Fetch match_count for each query variant
+            }
+            if filter_metadata:
+                params['filter'] = filter_metadata
+            
+            result = client.rpc('match_crawled_pages', params).execute()
+            if result.data:
+                all_results.extend(result.data)
+        except Exception as e:
+            print(f"Error searching documents for query '{queries[i]}': {e}")
+            continue # Continue with other queries
+
+    # Consolidate and de-duplicate results
+    unique_documents = {}
+    for doc in all_results:
+        # Create a unique ID for each document chunk.
+        # Assuming 'id' is the primary key from 'crawled_pages' table returned by RPC.
+        # If 'id' is not available or not unique per chunk, use url + chunk_number.
+        doc_id_val = doc.get('id') # Supabase typically returns an 'id' for each row.
+        if doc_id_val is None: # Fallback if 'id' is not in the result
+            doc_id_val = f"{doc.get('url')}_{doc.get('chunk_number', doc.get('metadata', {}).get('chunk_index'))}"
+
+
+        if doc_id_val not in unique_documents:
+            unique_documents[doc_id_val] = doc
+        else:
+            # Optional: If a document is found via multiple queries,
+            # one might implement a re-scoring logic here.
+            # For now, first-come, first-served.
+            pass 
+            
+    consolidated_results = list(unique_documents.values())
+    
+    # Sort by similarity if available and desired.
+    # The current Supabase RPC `match_crawled_pages` should return them sorted by similarity for each call.
+    # After merging, this order is partially lost. A simple re-sort if similarity is consistent:
+    # consolidated_results.sort(key=lambda x: x.get('similarity', 0), reverse=True)
+    # However, 'similarity' scores from different query embeddings might not be directly comparable.
+    # For now, we rely on the initial sort and deduplication.
+
+    # Trim to final match_count
+    return consolidated_results[:match_count]
+
+async def _get_relevance_score_for_document(
+    doc_content: str, original_query: str, reranker_model_choice: str
+) -> Optional[float]:
+    """
+    Helper async function to get relevance score for a single document.
+    Returns a float score or None if scoring fails.
+    """
+    prompt = f"""Given the User Query and the Document content below:
+
+User Query:
+{original_query}
+
+Document:
+{doc_content[:4000]} # Truncate doc_content to avoid excessive token usage
+
+Based on the Document's content, how relevant is it to the User Query?
+Please provide a relevance score as a single floating-point number between 0.0 (not relevant) and 1.0 (highly relevant).
+Output only the numerical score and nothing else. For example: 0.75
+"""
+    try:
+        response = await aclient.chat.completions.create(
+            model=reranker_model_choice,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an AI assistant that evaluates document relevance to a query and returns a numerical score.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=10, # Expecting just a number like "0.75"
+        )
+        score_text = response.choices[0].message.content.strip()
+        try:
+            score = float(score_text)
+            return max(0.0, min(1.0, score)) # Clamp score between 0.0 and 1.0
+        except ValueError:
+            print(f"Could not parse relevance score from LLM response: '{score_text}' for query '{original_query}'")
+            return None
+    except Exception as e:
+        print(f"Error calling LLM for relevance scoring (query: '{original_query}'): {e}")
+        return None
+
+async def rerank_retrieved_documents(
+    original_query: str,
+    documents: List[Dict[str, Any]],
+    reranker_model_choice: str,
+    # api_key is implicitly used by the aclient, so not needed as a direct param if aclient is global
+) -> List[Dict[str, Any]]:
+    """
+    Re-ranks retrieved documents based on LLM-evaluated relevance to the original query.
+    """
+    if not reranker_model_choice or not documents:
+        print("Skipping reranking: No reranker model specified or no documents to rank.")
+        return documents
+
+    if not os.getenv("OPENAI_API_KEY"):
+        print("Skipping reranking: OPENAI_API_KEY not found.")
+        return documents
+
+    print(f"Reranking {len(documents)} documents using model: {reranker_model_choice} for query: '{original_query}'")
+
+    # Create a list of tasks for asyncio.gather
+    tasks = [
+        _get_relevance_score_for_document(
+            doc.get("content", ""), original_query, reranker_model_choice
+        )
+        for doc in documents
+    ]
+    
+    # Run all scoring tasks concurrently
+    scores = await asyncio.gather(*tasks, return_exceptions=True) # return_exceptions to handle individual failures
+
+    # Add scores to documents and handle potential errors from gather
+    for i, doc in enumerate(documents):
+        score_result = scores[i]
+        if isinstance(score_result, Exception):
+            print(f"Exception during scoring document {i}: {score_result}")
+            doc["relevance_score"] = 0.0  # Assign default low score on error
+        elif score_result is None:
+            doc["relevance_score"] = 0.0 # Assign default low score if parsing failed or LLM error
+        else:
+            doc["relevance_score"] = score_result
+            
+    # Sort documents by relevance_score in descending order
+    # If scores are equal, maintain original relative order (Python's sort is stable)
+    documents.sort(key=lambda x: x.get("relevance_score", 0.0), reverse=True)
+    
+    print(f"Reranking completed. Top scores: {[doc.get('relevance_score') for doc in documents[:5]]}")
+    return documents
