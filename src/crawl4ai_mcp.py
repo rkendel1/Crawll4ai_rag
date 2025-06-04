@@ -5,6 +5,7 @@ This server provides tools to crawl websites using Crawl4AI, automatically detec
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
 """
 from mcp.server.fastmcp import FastMCP, Context
+from sentence_transformers import CrossEncoder
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -19,12 +20,21 @@ import asyncio
 import json
 import os
 import re
-import math
-from collections import Counter
+import concurrent.futures
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-# Updated utils import to include expand_query_with_llm and rerank_retrieved_documents
-from utils import get_supabase_client, add_documents_to_supabase, search_documents, expand_query_with_llm, rerank_retrieved_documents
+
+from utils import (
+    get_supabase_client, 
+    add_documents_to_supabase, 
+    search_documents,
+    extract_code_blocks,
+    generate_code_example_summary,
+    add_code_examples_to_supabase,
+    update_source_info,
+    extract_source_summary,
+    search_code_examples
+)
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -39,7 +49,8 @@ class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
     supabase_client: Client
-    
+    reranking_model: Optional[CrossEncoder] = None
+
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     """
@@ -64,10 +75,20 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     # Initialize Supabase client
     supabase_client = get_supabase_client()
     
+    # Initialize cross-encoder model for reranking if enabled
+    reranking_model = None
+    if os.getenv("USE_RERANKING", "false") == "true":
+        try:
+            reranking_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        except Exception as e:
+            print(f"Failed to load reranking model: {e}")
+            reranking_model = None
+    
     try:
         yield Crawl4AIContext(
             crawler=crawler,
-            supabase_client=supabase_client
+            supabase_client=supabase_client,
+            reranking_model=reranking_model
         )
     finally:
         # Clean up the crawler
@@ -81,6 +102,44 @@ mcp = FastMCP(
     host=os.getenv("HOST", "0.0.0.0"),
     port=os.getenv("PORT", "8051")
 )
+
+def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
+    """
+    Rerank search results using a cross-encoder model.
+    
+    Args:
+        model: The cross-encoder model to use for reranking
+        query: The search query
+        results: List of search results
+        content_key: The key in each result dict that contains the text content
+        
+    Returns:
+        Reranked list of results
+    """
+    if not model or not results:
+        return results
+    
+    try:
+        # Extract content from results
+        texts = [result.get(content_key, "") for result in results]
+        
+        # Create pairs of [query, document] for the cross-encoder
+        pairs = [[query, text] for text in texts]
+        
+        # Get relevance scores from the cross-encoder
+        scores = model.predict(pairs)
+        
+        # Add scores to results and sort by score (descending)
+        for i, result in enumerate(results):
+            result["rerank_score"] = float(scores[i])
+        
+        # Sort by rerank score
+        reranked = sorted(results, key=lambda x: x.get("rerank_score", 0), reverse=True)
+        
+        return reranked
+    except Exception as e:
+        print(f"Error during reranking: {e}")
+        return results
 
 def is_sitemap(url: str) -> bool:
     """
@@ -128,11 +187,20 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
 
     return urls
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
+def smart_chunk_markdown(text: str, chunk_size: int = 5000, overlap_size: int = None) -> List[str]:
+    """Split text into chunks, respecting code blocks and paragraphs, with optional overlap."""
     chunks = []
     start = 0
     text_length = len(text)
+    
+    # Enable overlap if the environment variable is set
+    use_overlapping_chunks = os.getenv("USE_OVERLAPPING_CHUNKS", "false").lower() == "true"
+    
+    # Default overlap is 10% of chunk size if enabled and not specified
+    if use_overlapping_chunks and overlap_size is None:
+        overlap_size = int(chunk_size * 0.1)
+    elif not use_overlapping_chunks:
+        overlap_size = 0
 
     while start < text_length:
         # Calculate end position
@@ -168,8 +236,23 @@ def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
         if chunk:
             chunks.append(chunk)
 
-        # Move start position for next chunk
-        start = end
+        # Move start position for next chunk with overlap
+        if overlap_size > 0 and end < text_length:
+            # Find a good overlap point (try to start at beginning of sentence/paragraph)
+            overlap_start = max(start, end - overlap_size)
+            overlap_text = text[overlap_start:end]
+            
+            # Try to find a good starting point in the overlap region
+            sentence_start = overlap_text.find('. ')
+            if sentence_start != -1:
+                start = overlap_start + sentence_start + 2
+            elif '\n\n' in overlap_text:
+                para_start = overlap_text.find('\n\n')
+                start = overlap_start + para_start + 2
+            else:
+                start = overlap_start
+        else:
+            start = end
 
     return chunks
 
@@ -183,72 +266,28 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
     Returns:
         Dictionary with headers and stats
     """
-    # Keyword extraction parameters
-    TOP_N_KEYWORDS = 5
-    # Basic stop words list (can be expanded)
-    STOP_WORDS = set([
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "should",
-        "can", "could", "may", "might", "must", "and", "or", "but", "if",
-        "then", "else", "when", "where", "why", "how", "all", "any", "both",
-        "each", "few", "more", "most", "other", "some", "such", "no", "nor",
-        "not", "only", "own", "same", "so", "than", "too", "very", "s", "t",
-        "just", "don", "now", "in", "on", "at", "by", "for", "with", "about",
-        "against", "between", "into", "through", "during", "before", "after",
-        "above", "below", "to", "from", "up", "down", "out", "off", "over",
-        "under", "again", "further", "then", "once", "here", "there", "when",
-        "where", "why", "how", "all", "any", "both", "each", "few", "more",
-        "most", "other", "some", "such", "no", "nor", "not", "only", "own",
-        "same", "so", "than", "too", "very"
-    ])
-
-    # Hierarchical header extraction
-    headers = []
-    current_header_path = []
-    header_levels = [0] * 6  # For H1 to H6
-
-    # Legacy header string (optional, can be removed if not needed for backward compatibility)
-    legacy_headers_list = []
-
-    lines = chunk.split('\n')
-    for line in lines:
-        match = re.match(r'^(#+)\s+(.+)$', line)
-        if match:
-            level = len(match.group(1))
-            title = match.group(2).strip()
-            legacy_headers_list.append(f'{match.group(1)} {title}')
-
-            # Update header_levels for current and higher levels
-            header_levels[level - 1] = title
-            for i in range(level, 6):
-                header_levels[i] = None  # Reset deeper levels
-
-            # Construct current path
-            current_path_parts = [h for h in header_levels[:level] if h]
-            if current_path_parts:
-                headers.append(" > ".join(current_path_parts))
-
-    header_str = '; '.join(legacy_headers_list) if legacy_headers_list else ''
-
-    # Keyword Extraction (TF-based)
-    words = re.findall(r'\b\w+\b', chunk.lower())
-    # Filter out stop words and non-alphabetic tokens
-    filtered_words = [word for word in words if word.isalpha() and word not in STOP_WORDS and len(word) > 2]
-    
-    keywords = []
-    if filtered_words:
-        term_frequency = Counter(filtered_words)
-        # Get top N keywords
-        top_keywords = term_frequency.most_common(TOP_N_KEYWORDS)
-        keywords = [kw[0] for kw in top_keywords]
+    headers = re.findall(r'^(#+)\s+(.+)$', chunk, re.MULTILINE)
+    header_str = '; '.join([f'{h[0]} {h[1]}' for h in headers]) if headers else ''
 
     return {
-        "headers": header_str,  # Legacy format for compatibility
-        "header_path": headers if headers else None, # New hierarchical format
-        "keywords": keywords if keywords else None, # New keywords
+        "headers": header_str,
         "char_count": len(chunk),
         "word_count": len(chunk.split())
     }
+
+def process_code_example(args):
+    """
+    Process a single code example to generate its summary.
+    This function is designed to be used with concurrent.futures.
+    
+    Args:
+        args: Tuple containing (code, context_before, context_after)
+        
+    Returns:
+        The generated summary
+    """
+    code, context_before, context_after = args
+    return generate_code_example_summary(code, context_before, context_after)
 
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
@@ -277,6 +316,10 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         result = await crawler.arun(url=url, config=run_config)
         
         if result.success and result.markdown:
+            # Extract source_id
+            parsed_url = urlparse(url)
+            source_id = parsed_url.netloc or parsed_url.path
+            
             # Chunk the content
             chunks = smart_chunk_markdown(result.markdown)
             
@@ -285,6 +328,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             chunk_numbers = []
             contents = []
             metadatas = []
+            total_word_count = 0
             
             for i, chunk in enumerate(chunks):
                 urls.append(url)
@@ -295,21 +339,78 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                 meta = extract_section_info(chunk)
                 meta["chunk_index"] = i
                 meta["url"] = url
-                meta["source"] = urlparse(url).netloc
+                meta["source"] = source_id
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
+                
+                # Accumulate word count
+                total_word_count += meta.get("word_count", 0)
             
             # Create url_to_full_document mapping
             url_to_full_document = {url: result.markdown}
             
-            # Add to Supabase
+            # Update source information FIRST (before inserting documents)
+            source_summary = extract_source_summary(source_id, result.markdown[:5000])  # Use first 5000 chars for summary
+            update_source_info(supabase_client, source_id, source_summary, total_word_count)
+            
+            # Add documentation chunks to Supabase (AFTER source exists)
             add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+            
+            # Extract and process code examples only if enabled
+            extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+            if extract_code_examples:
+                code_blocks = extract_code_blocks(result.markdown)
+                if code_blocks:
+                    code_urls = []
+                    code_chunk_numbers = []
+                    code_examples = []
+                    code_summaries = []
+                    code_metadatas = []
+                    
+                    # Process code examples in parallel
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        # Prepare arguments for parallel processing
+                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
+                                        for block in code_blocks]
+                        
+                        # Generate summaries in parallel
+                        summaries = list(executor.map(process_code_example, summary_args))
+                    
+                    # Prepare code example data
+                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                        code_urls.append(url)
+                        code_chunk_numbers.append(i)
+                        code_examples.append(block['code'])
+                        code_summaries.append(summary)
+                        
+                        # Create metadata for code example
+                        code_meta = {
+                            "chunk_index": i,
+                            "url": url,
+                            "source": source_id,
+                            "char_count": len(block['code']),
+                            "word_count": len(block['code'].split())
+                        }
+                        code_metadatas.append(code_meta)
+                    
+                    # Add code examples to Supabase
+                    add_code_examples_to_supabase(
+                        supabase_client, 
+                        code_urls, 
+                        code_chunk_numbers, 
+                        code_examples, 
+                        code_summaries, 
+                        code_metadatas
+                    )
             
             return json.dumps({
                 "success": True,
                 "url": url,
                 "chunks_stored": len(chunks),
+                "code_examples_stored": len(code_blocks) if code_blocks else 0,
                 "content_length": len(result.markdown),
+                "total_word_count": total_word_count,
+                "source_id": source_id,
                 "links_count": {
                     "internal": len(result.links.get("internal", [])),
                     "external": len(result.links.get("external", []))
@@ -351,14 +452,14 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         JSON string with crawl summary and storage information
     """
     try:
-        # Get the crawler and Supabase client from the context
+        # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
         supabase_client = ctx.request_context.lifespan_context.supabase_client
         
+        # Determine the crawl strategy
         crawl_results = []
-        crawl_type = "webpage"
+        crawl_type = None
         
-        # Detect URL type and use appropriate crawl method
         if is_txt(url):
             # For text files, use simple crawl
             crawl_results = await crawl_markdown_file(crawler, url)
@@ -393,10 +494,24 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         metadatas = []
         chunk_count = 0
         
+        # Track sources and their content
+        source_content_map = {}
+        source_word_counts = {}
+        
+        # Process documentation chunks
         for doc in crawl_results:
             source_url = doc['url']
             md = doc['markdown']
             chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+            
+            # Extract source_id
+            parsed_url = urlparse(source_url)
+            source_id = parsed_url.netloc or parsed_url.path
+            
+            # Store content for source summary generation
+            if source_id not in source_content_map:
+                source_content_map[source_id] = md[:5000]  # Store first 5000 chars
+                source_word_counts[source_id] = 0
             
             for i, chunk in enumerate(chunks):
                 urls.append(source_url)
@@ -407,10 +522,13 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 meta = extract_section_info(chunk)
                 meta["chunk_index"] = i
                 meta["url"] = source_url
-                meta["source"] = urlparse(source_url).netloc
+                meta["source"] = source_id
                 meta["crawl_type"] = crawl_type
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
                 metadatas.append(meta)
+                
+                # Accumulate word count
+                source_word_counts[source_id] += meta.get("word_count", 0)
                 
                 chunk_count += 1
         
@@ -419,10 +537,76 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         for doc in crawl_results:
             url_to_full_document[doc['url']] = doc['markdown']
         
-        # Add to Supabase
-        # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
+        # Update source information for each unique source FIRST (before inserting documents)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
+            source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
+        
+        for (source_id, _), summary in zip(source_summary_args, source_summaries):
+            word_count = source_word_counts.get(source_id, 0)
+            update_source_info(supabase_client, source_id, summary, word_count)
+        
+        # Add documentation chunks to Supabase (AFTER sources exist)
         batch_size = 20
         add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+        
+        # Extract and process code examples from all documents only if enabled
+        extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+        if extract_code_examples_enabled:
+            all_code_blocks = []
+            code_urls = []
+            code_chunk_numbers = []
+            code_examples = []
+            code_summaries = []
+            code_metadatas = []
+            
+            # Extract code blocks from all documents
+            for doc in crawl_results:
+                source_url = doc['url']
+                md = doc['markdown']
+                code_blocks = extract_code_blocks(md)
+                
+                if code_blocks:
+                    # Process code examples in parallel
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        # Prepare arguments for parallel processing
+                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
+                                        for block in code_blocks]
+                        
+                        # Generate summaries in parallel
+                        summaries = list(executor.map(process_code_example, summary_args))
+                    
+                    # Prepare code example data
+                    parsed_url = urlparse(source_url)
+                    source_id = parsed_url.netloc or parsed_url.path
+                    
+                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
+                        code_urls.append(source_url)
+                        code_chunk_numbers.append(len(code_examples))  # Use global code example index
+                        code_examples.append(block['code'])
+                        code_summaries.append(summary)
+                        
+                        # Create metadata for code example
+                        code_meta = {
+                            "chunk_index": len(code_examples) - 1,
+                            "url": source_url,
+                            "source": source_id,
+                            "char_count": len(block['code']),
+                            "word_count": len(block['code'].split())
+                        }
+                        code_metadatas.append(code_meta)
+            
+            # Add all code examples to Supabase
+            if code_examples:
+                add_code_examples_to_supabase(
+                    supabase_client, 
+                    code_urls, 
+                    code_chunk_numbers, 
+                    code_examples, 
+                    code_summaries, 
+                    code_metadatas,
+                    batch_size=batch_size
+                )
         
         return json.dumps({
             "success": True,
@@ -430,12 +614,361 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             "crawl_type": crawl_type,
             "pages_crawled": len(crawl_results),
             "chunks_stored": chunk_count,
+            "code_examples_stored": len(code_examples),
+            "sources_updated": len(source_content_map),
             "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
         }, indent=2)
     except Exception as e:
         return json.dumps({
             "success": False,
             "url": url,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
+async def get_available_sources(ctx: Context) -> str:
+    """
+    Get all available sources from the sources table.
+    
+    This tool returns a list of all unique sources (domains) that have been crawled and stored
+    in the database, along with their summaries and statistics. This is useful for discovering 
+    what content is available for querying.
+
+    Always use this tool before calling the RAG query or code example query tool
+    with a specific source filter!
+    
+    Args:
+        ctx: The MCP server provided context
+    
+    Returns:
+        JSON string with the list of available sources and their details
+    """
+    try:
+        # Get the Supabase client from the context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Query the sources table directly
+        result = supabase_client.from_('sources')\
+            .select('*')\
+            .order('source_id')\
+            .execute()
+        
+        # Format the sources with their details
+        sources = []
+        if result.data:
+            for source in result.data:
+                sources.append({
+                    "source_id": source.get("source_id"),
+                    "summary": source.get("summary"),
+                    "total_words": source.get("total_words"),
+                    "created_at": source.get("created_at"),
+                    "updated_at": source.get("updated_at")
+                })
+        
+        return json.dumps({
+            "success": True,
+            "sources": sources,
+            "count": len(sources)
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
+async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
+    """
+    Perform a RAG (Retrieval Augmented Generation) query on the stored content.
+    
+    This tool searches the vector database for content relevant to the query and returns
+    the matching documents. Optionally filter by source domain.
+    Get the source by using the get_available_sources tool before calling this search!
+    
+    Args:
+        ctx: The MCP server provided context
+        query: The search query
+        source: Optional source domain to filter results (e.g., 'example.com')
+        match_count: Maximum number of results to return (default: 5)
+    
+    Returns:
+        JSON string with the search results
+    """
+    try:
+        # Get the Supabase client from the context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Check if hybrid search is enabled
+        use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
+        
+        # Prepare filter if source is provided and not empty
+        filter_metadata = None
+        if source and source.strip():
+            filter_metadata = {"source": source}
+        
+        if use_hybrid_search:
+            # Hybrid search: combine vector and keyword search
+            
+            # 1. Get vector search results (get more to account for filtering)
+            vector_results = search_documents(
+                client=supabase_client,
+                query=query,
+                match_count=match_count * 2,  # Get double to have room for filtering
+                filter_metadata=filter_metadata
+            )
+            
+            # 2. Get keyword search results using ILIKE
+            keyword_query = supabase_client.from_('crawled_pages')\
+                .select('id, url, chunk_number, content, metadata, source_id')\
+                .ilike('content', f'%{query}%')
+            
+            # Apply source filter if provided
+            if source and source.strip():
+                keyword_query = keyword_query.eq('source_id', source)
+            
+            # Execute keyword search
+            keyword_response = keyword_query.limit(match_count * 2).execute()
+            keyword_results = keyword_response.data if keyword_response.data else []
+            
+            # 3. Combine results with preference for items appearing in both
+            seen_ids = set()
+            combined_results = []
+            
+            # First, add items that appear in both searches (these are the best matches)
+            vector_ids = {r.get('id') for r in vector_results if r.get('id')}
+            for kr in keyword_results:
+                if kr['id'] in vector_ids and kr['id'] not in seen_ids:
+                    # Find the vector result to get similarity score
+                    for vr in vector_results:
+                        if vr.get('id') == kr['id']:
+                            # Boost similarity score for items in both results
+                            vr['similarity'] = min(1.0, vr.get('similarity', 0) * 1.2)
+                            combined_results.append(vr)
+                            seen_ids.add(kr['id'])
+                            break
+            
+            # Then add remaining vector results (semantic matches without exact keyword)
+            for vr in vector_results:
+                if vr.get('id') and vr['id'] not in seen_ids and len(combined_results) < match_count:
+                    combined_results.append(vr)
+                    seen_ids.add(vr['id'])
+            
+            # Finally, add pure keyword matches if we still need more results
+            for kr in keyword_results:
+                if kr['id'] not in seen_ids and len(combined_results) < match_count:
+                    # Convert keyword result to match vector result format
+                    combined_results.append({
+                        'id': kr['id'],
+                        'url': kr['url'],
+                        'chunk_number': kr['chunk_number'],
+                        'content': kr['content'],
+                        'metadata': kr['metadata'],
+                        'source_id': kr['source_id'],
+                        'similarity': 0.5  # Default similarity for keyword-only matches
+                    })
+                    seen_ids.add(kr['id'])
+            
+            # Use combined results
+            results = combined_results[:match_count]
+            
+        else:
+            # Standard vector search only
+            results = search_documents(
+                client=supabase_client,
+                query=query,
+                match_count=match_count,
+                filter_metadata=filter_metadata
+            )
+        
+        # Apply reranking if enabled
+        use_reranking = os.getenv("USE_RERANKING", "false") == "true"
+        if use_reranking and ctx.request_context.lifespan_context.reranking_model:
+            results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+        
+        # Format the results
+        formatted_results = []
+        for result in results:
+            formatted_result = {
+                "url": result.get("url"),
+                "content": result.get("content"),
+                "metadata": result.get("metadata"),
+                "similarity": result.get("similarity")
+            }
+            # Include rerank score if available
+            if "rerank_score" in result:
+                formatted_result["rerank_score"] = result["rerank_score"]
+            formatted_results.append(formatted_result)
+        
+        return json.dumps({
+            "success": True,
+            "query": query,
+            "source_filter": source,
+            "search_mode": "hybrid" if use_hybrid_search else "vector",
+            "reranking_applied": use_reranking and ctx.request_context.lifespan_context.reranking_model is not None,
+            "results": formatted_results,
+            "count": len(formatted_results)
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "query": query,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
+async def search_code_examples(ctx: Context, query: str, source_id: str = None, match_count: int = 5) -> str:
+    """
+    Search for code examples relevant to the query.
+    
+    This tool searches the vector database for code examples relevant to the query and returns
+    the matching examples with their summaries. Optionally filter by source_id.
+    Get the source_id by using the get_available_sources tool before calling this search!
+
+    Use the get_available_sources tool first to see what sources are available for filtering.
+    
+    Args:
+        ctx: The MCP server provided context
+        query: The search query
+        source_id: Optional source ID to filter results (e.g., 'example.com')
+        match_count: Maximum number of results to return (default: 5)
+    
+    Returns:
+        JSON string with the search results
+    """
+    # Check if code example extraction is enabled
+    extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+    if not extract_code_examples_enabled:
+        return json.dumps({
+            "success": False,
+            "error": "Code example extraction is disabled. Perform a normal RAG search."
+        }, indent=2)
+    
+    try:
+        # Get the Supabase client from the context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Check if hybrid search is enabled
+        use_hybrid_search = os.getenv("USE_HYBRID_SEARCH", "false") == "true"
+        
+        # Prepare filter if source is provided and not empty
+        filter_metadata = None
+        if source_id and source_id.strip():
+            filter_metadata = {"source": source_id}
+        
+        if use_hybrid_search:
+            # Hybrid search: combine vector and keyword search
+            
+            # Import the search function from utils
+            from utils import search_code_examples as search_code_examples_impl
+            
+            # 1. Get vector search results (get more to account for filtering)
+            vector_results = search_code_examples_impl(
+                client=supabase_client,
+                query=query,
+                match_count=match_count * 2,  # Get double to have room for filtering
+                filter_metadata=filter_metadata
+            )
+            
+            # 2. Get keyword search results using ILIKE on both content and summary
+            keyword_query = supabase_client.from_('code_examples')\
+                .select('id, url, chunk_number, content, summary, metadata, source_id')\
+                .or_(f'content.ilike.%{query}%,summary.ilike.%{query}%')
+            
+            # Apply source filter if provided
+            if source_id and source_id.strip():
+                keyword_query = keyword_query.eq('source_id', source_id)
+            
+            # Execute keyword search
+            keyword_response = keyword_query.limit(match_count * 2).execute()
+            keyword_results = keyword_response.data if keyword_response.data else []
+            
+            # 3. Combine results with preference for items appearing in both
+            seen_ids = set()
+            combined_results = []
+            
+            # First, add items that appear in both searches (these are the best matches)
+            vector_ids = {r.get('id') for r in vector_results if r.get('id')}
+            for kr in keyword_results:
+                if kr['id'] in vector_ids and kr['id'] not in seen_ids:
+                    # Find the vector result to get similarity score
+                    for vr in vector_results:
+                        if vr.get('id') == kr['id']:
+                            # Boost similarity score for items in both results
+                            vr['similarity'] = min(1.0, vr.get('similarity', 0) * 1.2)
+                            combined_results.append(vr)
+                            seen_ids.add(kr['id'])
+                            break
+            
+            # Then add remaining vector results (semantic matches without exact keyword)
+            for vr in vector_results:
+                if vr.get('id') and vr['id'] not in seen_ids and len(combined_results) < match_count:
+                    combined_results.append(vr)
+                    seen_ids.add(vr['id'])
+            
+            # Finally, add pure keyword matches if we still need more results
+            for kr in keyword_results:
+                if kr['id'] not in seen_ids and len(combined_results) < match_count:
+                    # Convert keyword result to match vector result format
+                    combined_results.append({
+                        'id': kr['id'],
+                        'url': kr['url'],
+                        'chunk_number': kr['chunk_number'],
+                        'content': kr['content'],
+                        'summary': kr['summary'],
+                        'metadata': kr['metadata'],
+                        'source_id': kr['source_id'],
+                        'similarity': 0.5  # Default similarity for keyword-only matches
+                    })
+                    seen_ids.add(kr['id'])
+            
+            # Use combined results
+            results = combined_results[:match_count]
+            
+        else:
+            # Standard vector search only
+            from utils import search_code_examples as search_code_examples_impl
+            
+            results = search_code_examples_impl(
+                client=supabase_client,
+                query=query,
+                match_count=match_count,
+                filter_metadata=filter_metadata
+            )
+        
+        # Apply reranking if enabled
+        use_reranking = os.getenv("USE_RERANKING", "false") == "true"
+        if use_reranking and ctx.request_context.lifespan_context.reranking_model:
+            results = rerank_results(ctx.request_context.lifespan_context.reranking_model, query, results, content_key="content")
+        
+        # Format the results
+        formatted_results = []
+        for result in results:
+            formatted_result = {
+                "url": result.get("url"),
+                "code": result.get("content"),
+                "summary": result.get("summary"),
+                "metadata": result.get("metadata"),
+                "source_id": result.get("source_id"),
+                "similarity": result.get("similarity")
+            }
+            # Include rerank score if available
+            if "rerank_score" in result:
+                formatted_result["rerank_score"] = result["rerank_score"]
+            formatted_results.append(formatted_result)
+        
+        return json.dumps({
+            "success": True,
+            "query": query,
+            "source_filter": source_id,
+            "search_mode": "hybrid" if use_hybrid_search else "vector",
+            "reranking_applied": use_reranking and ctx.request_context.lifespan_context.reranking_model is not None,
+            "results": formatted_results,
+            "count": len(formatted_results)
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "query": query,
             "error": str(e)
         }, indent=2)
 
@@ -531,158 +1064,6 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         current_urls = next_level_urls
 
     return results_all
-
-@mcp.tool()
-async def get_available_sources(ctx: Context) -> str:
-    """
-    Get all available sources based on unique source metadata values.
-    
-    This tool returns a list of all unique sources (domains) that have been crawled and stored
-    in the database. This is useful for discovering what content is available for querying.
-    
-    Args:
-        ctx: The MCP server provided context
-    
-    Returns:
-        JSON string with the list of available sources
-    """
-    try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        
-        # Use a direct query with the Supabase client
-        # This could be more efficient with a direct Postgres query but
-        # I don't want to require users to set a DB_URL environment variable as well
-        result = supabase_client.from_('crawled_pages')\
-            .select('metadata')\
-            .not_.is_('metadata->>source', 'null')\
-            .execute()
-            
-        # Use a set to efficiently track unique sources
-        unique_sources = set()
-        
-        # Extract the source values from the result using a set for uniqueness
-        if result.data:
-            for item in result.data:
-                source = item.get('metadata', {}).get('source')
-                if source:
-                    unique_sources.add(source)
-        
-        # Convert set to sorted list for consistent output
-        sources = sorted(list(unique_sources))
-        
-        return json.dumps({
-            "success": True,
-            "sources": sources,
-            "count": len(sources)
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({
-            "success": False,
-            "error": str(e)
-        }, indent=2)
-
-@mcp.tool()
-async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
-    """
-    Perform a RAG (Retrieval Augmented Generation) query on the stored content.
-    
-    This tool searches the vector database for content relevant to the query and returns
-    the matching documents. Optionally filter by source domain.
-
-    Use the tool to get source domains if the user is asking to use a specific tool or framework.
-    
-    Args:
-        ctx: The MCP server provided context
-        query: The search query
-        source: Optional source domain to filter results (e.g., 'example.com')
-        match_count: Maximum number of results to return (default: 5)
-    
-    Returns:
-        JSON string with the search results
-    """
-    try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
-        model_choice = os.getenv("MODEL_CHOICE")
-
-        all_queries = [query] # Start with the original query
-
-        if model_choice and model_choice.strip():
-            print(f"Attempting to expand query using LLM: {model_choice}")
-            expanded_queries = await expand_query_with_llm(query, model_choice)
-            if expanded_queries:
-                print(f"Expanded queries: {expanded_queries}")
-                all_queries.extend(expanded_queries)
-            else:
-                print("Query expansion did not return any new queries or failed.")
-        else:
-            print("MODEL_CHOICE not set, skipping query expansion.")
-
-        # Prepare filter if source is provided and not empty
-        filter_metadata = None
-        if source and source.strip():
-            filter_metadata = {"source": source}
-        
-        # Perform the search using all queries (original + expanded)
-        results = search_documents(
-            client=supabase_client,
-            queries=all_queries, # Pass list of queries
-            match_count=match_count,
-            filter_metadata=filter_metadata
-        )
-        
-        # Re-ranking step
-        reranking_applied = False
-        reranker_model_env = os.getenv("RERANKER_MODEL_CHOICE")
-        openai_api_key = os.getenv("OPENAI_API_KEY") # Already loaded, but good to check availability for this step
-        
-        actual_reranker_model = reranker_model_env if reranker_model_env else model_choice # Fallback to MODEL_CHOICE
-
-        if actual_reranker_model and openai_api_key and results:
-            print(f"Attempting to rerank {len(results)} documents using model: {actual_reranker_model}")
-            results = await rerank_retrieved_documents(
-                original_query=query, # Use the initial original query for reranking context
-                documents=results,
-                reranker_model_choice=actual_reranker_model
-            )
-            reranking_applied = True
-            print("Reranking completed.")
-        elif not results:
-            print("No results from search_documents to rerank.")
-        else:
-            print(f"Skipping reranking. Reranker Model: '{actual_reranker_model}', API Key Available: {bool(openai_api_key)}")
-
-        # Format the results
-        # The 'results' variable now contains potentially reranked and scored documents
-        formatted_results = []
-        for result_doc in results: # Changed variable name to avoid conflict
-            doc_data = {
-                "url": result_doc.get("url"),
-                "content": result_doc.get("content"), # Content is already part of the document
-                "metadata": result_doc.get("metadata"),
-                "similarity": result_doc.get("similarity") # Original similarity from vector search
-            }
-            if "relevance_score" in result_doc:
-                doc_data["relevance_score"] = result_doc.get("relevance_score")
-            formatted_results.append(doc_data)
-        
-        return json.dumps({
-            "success": True,
-            "original_query": query,
-            "queries_used": all_queries,
-            "source_filter": source,
-            "reranking_applied": reranking_applied,
-            "results": formatted_results,
-            "count": len(formatted_results)
-        }, indent=2)
-    except Exception as e:
-        # Ensure error response also includes original_query for consistency
-        return json.dumps({
-            "success": False,
-            "original_query": query, # Add original_query here as well
-            "error": str(e)
-        }, indent=2)
 
 async def main():
     transport = os.getenv("TRANSPORT", "sse")

@@ -13,6 +13,7 @@ COPY . .
 # Install packages directly to the system (no virtual environment)
 # Combining commands to reduce Docker layers
 RUN uv pip install --system -e . && \
+    uv pip install --system huggingface_hub[hf_xet] && \
     crawl4ai-setup
 
 EXPOSE ${PORT}

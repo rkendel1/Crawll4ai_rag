@@ -5,18 +5,95 @@ import os
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import json
-import asyncio # Added for asyncio.to_thread if needed, and for async functions
 from supabase import create_client, Client
 from urllib.parse import urlparse
 import openai
-from openai import AsyncOpenAI # For async LLM calls
+import re
+import time
+import requests
 
-# Initialize OpenAI clients
-# Synchronous client for existing functions (embeddings, contextual_embedding)
-openai.api_key = os.getenv("OPENAI_API_KEY") 
-# Asynchronous client for new query expansion function
-# Ensure OPENAI_API_KEY is loaded before this
-aclient = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Load OpenAI API key for embeddings
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Check if we're using OpenRouter
+USE_OPENROUTER = os.getenv("LLM_PROVIDER", "openai").lower() == "openrouter"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+def create_chat_completion(
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.3,
+    max_tokens: int = 200
+) -> Any:
+    """
+    Create a chat completion using either OpenAI or OpenRouter based on configuration.
+    
+    Args:
+        model: The model to use
+        messages: List of message dictionaries
+        temperature: Temperature for the model
+        max_tokens: Maximum tokens to generate
+        
+    Returns:
+        The completion response object
+    """
+    if USE_OPENROUTER and OPENROUTER_API_KEY:
+        # Use OpenRouter
+        # Always use the model specified in OPENROUTER_MODEL env var when using OpenRouter
+        model_to_use = os.getenv("OPENROUTER_MODEL")
+        
+        if not model_to_use:
+            # Fall back to MODEL_CHOICE if OPENROUTER_MODEL is not set
+            model_to_use = os.getenv("MODEL_CHOICE", model)
+        
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://github.com/crawl4ai/mcp-crawl4ai-rag"),
+            "X-Title": os.getenv("OPENROUTER_APP_NAME", "Crawl4AI MCP Server")
+        }
+        
+        data = {
+            "model": model_to_use,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        
+        response = requests.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers=headers,
+            json=data
+        )
+        
+        if response.status_code != 200:
+            raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
+        
+        # Convert the response to match OpenAI's structure
+        result = response.json()
+        
+        # Create a mock OpenAI-style response object
+        class MockChoice:
+            def __init__(self, content):
+                self.message = type('obj', (object,), {'content': content})
+        
+        class MockResponse:
+            def __init__(self, choices):
+                self.choices = choices
+        
+        if 'choices' in result and len(result['choices']) > 0:
+            return MockResponse([MockChoice(result['choices'][0]['message']['content'])])
+        else:
+            raise Exception("Invalid response from OpenRouter")
+    else:
+        # Use OpenAI
+        return openai.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
 
 def get_supabase_client() -> Client:
     """
@@ -45,17 +122,45 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
     if not texts:
         return []
-        
-    try:
-        response = openai.embeddings.create(
-            model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
-            input=texts
-        )
-        return [item.embedding for item in response.data]
-    except Exception as e:
-        print(f"Error creating batch embeddings: {e}")
-        # Return empty embeddings if there's an error
-        return [[0.0] * 1536 for _ in range(len(texts))]
+    
+    max_retries = 3
+    retry_delay = 1.0  # Start with 1 second delay
+    
+    for retry in range(max_retries):
+        try:
+            response = openai.embeddings.create(
+                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
+                input=texts
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            if retry < max_retries - 1:
+                print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
+                # Try creating embeddings one by one as fallback
+                print("Attempting to create embeddings individually...")
+                embeddings = []
+                successful_count = 0
+                
+                for i, text in enumerate(texts):
+                    try:
+                        individual_response = openai.embeddings.create(
+                            model="text-embedding-3-small",
+                            input=[text]
+                        )
+                        embeddings.append(individual_response.data[0].embedding)
+                        successful_count += 1
+                    except Exception as individual_error:
+                        print(f"Failed to create embedding for text {i}: {individual_error}")
+                        # Add zero embedding as fallback
+                        embeddings.append([0.0] * 1536)
+                
+                print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
+                return embeddings
 
 def create_embedding(text: str) -> List[float]:
     """
@@ -101,8 +206,8 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
+        # Call the LLM API to generate contextual information
+        response = create_chat_completion(
             model=model_choice,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
@@ -123,83 +228,6 @@ Please give a short succinct context to situate this chunk within the overall do
     except Exception as e:
         print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
         return chunk, False
-
-async def expand_query_with_llm(original_query: str, model_choice: str) -> List[str]:
-    """
-    Expand the original query with LLM-generated alternative formulations.
-    Returns a list of expanded queries, or an empty list if failed.
-    """
-    if not model_choice or not original_query:
-        return []
-
-    prompt = f"""Given the following user query for information retrieval:
-"{original_query}"
-
-Please generate 2-3 alternative formulations or related questions that would be helpful for retrieving a broader set of relevant documents.
-Return your answer as a JSON list of strings. For example:
-["alternative query 1", "related question 2"]
-Return only the JSON list and nothing else.
-"""
-    try:
-        response = await aclient.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that expands user queries for information retrieval. You must respond with only a valid JSON list of strings."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=150,
-            response_format={"type": "json_object"} # Ensure JSON output
-        )
-        content = response.choices[0].message.content
-        if content:
-            # The response_format="json_object" should ensure it's a JSON object,
-            # but the prompt asks for a list. Let's assume the LLM might wrap it in a key.
-            # Or it might return a JSON string that is a list.
-            try:
-                # Attempt to parse the entire content as a JSON list
-                expanded_queries = json.loads(content)
-                if isinstance(expanded_queries, list) and all(isinstance(q, str) for q in expanded_queries):
-                    return expanded_queries
-                # If it's a dict, look for a key that contains a list of strings
-                elif isinstance(expanded_queries, dict):
-                    for key, value in expanded_queries.items():
-                        if isinstance(value, list) and all(isinstance(q, str) for q in value):
-                            return value
-                print(f"LLM returned JSON, but not in the expected list format: {content}")
-                return []
-            except json.JSONDecodeError:
-                # Fallback for cases where LLM doesn't strictly adhere to JSON list,
-                # e.g. if it returns newline-separated strings despite the prompt.
-                # This is less ideal if JSON was expected.
-                # Given response_format="json_object", this fallback might be less necessary.
-                cleaned_content = content.strip().replace("```json", "").replace("```", "").strip()
-                if cleaned_content.startswith('[') and cleaned_content.endswith(']'):
-                    try:
-                        expanded_queries = json.loads(cleaned_content)
-                        if isinstance(expanded_queries, list) and all(isinstance(q, str) for q in expanded_queries):
-                            return expanded_queries
-                    except json.JSONDecodeError:
-                        print(f"Failed to parse LLM response as JSON list after cleaning: {cleaned_content}")
-                        pass # Fall through to trying newline separation if robust parsing fails
-
-                # As a last resort, try splitting by newlines if it's not a JSON list
-                # This is a weaker fallback.
-                if not (cleaned_content.startswith('[') and cleaned_content.endswith(']')):
-                    queries = [q.strip() for q in cleaned_content.split('\n') if q.strip()]
-                    # Filter out any potential non-query lines if the LLM added extra text
-                    # (though it was instructed not to)
-                    # A simple heuristic: queries are usually not extremely short or long.
-                    queries = [q for q in queries if 2 < len(q.split()) < 20 and 'query' not in q.lower() and 'question' not in q.lower()]
-                    if queries:
-                        return queries
-                
-                print(f"Could not parse LLM response for query expansion: {content}")
-                return []
-        return []
-    except Exception as e:
-        print(f"Error calling LLM for query expansion: {e}")
-        return []
 
 def process_chunk_with_context(args):
     """
@@ -258,8 +286,8 @@ def add_documents_to_supabase(
                 # Continue with the next URL even if one fails
     
     # Check if MODEL_CHOICE is set for contextual embeddings
-    model_choice = os.getenv("MODEL_CHOICE")
-    use_contextual_embeddings = bool(model_choice)
+    use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
+    print(f"\n\nUse contextual embeddings: {use_contextual_embeddings}\n\n")
     
     # Process in batches to avoid memory issues
     for i in range(0, len(contents), batch_size):
@@ -317,6 +345,10 @@ def add_documents_to_supabase(
             # Extract metadata fields
             chunk_size = len(contextual_contents[j])
             
+            # Extract source_id from URL
+            parsed_url = urlparse(batch_urls[j])
+            source_id = parsed_url.netloc or parsed_url.path
+            
             # Prepare data for insertion
             data = {
                 "url": batch_urls[j],
@@ -326,198 +358,510 @@ def add_documents_to_supabase(
                     "chunk_size": chunk_size,
                     **batch_metadatas[j]
                 },
+                "source_id": source_id,  # Add source_id field
                 "embedding": batch_embeddings[j]  # Use embedding from contextual content
             }
             
             batch_data.append(data)
         
-        # Insert batch into Supabase
-        try:
-            client.table("crawled_pages").insert(batch_data).execute()
-        except Exception as e:
-            print(f"Error inserting batch into Supabase: {e}")
+        # Insert batch into Supabase with retry logic
+        max_retries = 3
+        retry_delay = 1.0  # Start with 1 second delay
+        
+        for retry in range(max_retries):
+            try:
+                client.table("crawled_pages").insert(batch_data).execute()
+                # Success - break out of retry loop
+                break
+            except Exception as e:
+                if retry < max_retries - 1:
+                    print(f"Error inserting batch into Supabase (attempt {retry + 1}/{max_retries}): {e}")
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    # Final attempt failed
+                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
+                    # Optionally, try inserting records one by one as a last resort
+                    print("Attempting to insert records individually...")
+                    successful_inserts = 0
+                    for record in batch_data:
+                        try:
+                            client.table("crawled_pages").insert(record).execute()
+                            successful_inserts += 1
+                        except Exception as individual_error:
+                            print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
+                    
+                    if successful_inserts > 0:
+                        print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+
+def expand_query(query: str) -> str:
+    """
+    Expand a query to include related terms and concepts for better retrieval.
+    
+    Args:
+        query: The original query
+        
+    Returns:
+        Expanded query with additional terms
+    """
+    use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "false").lower() == "true"
+    
+    if not use_query_expansion:
+        return query
+    
+    model_choice = os.getenv("MODEL_CHOICE", "gpt-4.1-nano")
+    
+    prompt = f"""Given this search query: "{query}"
+
+Generate an expanded version that includes:
+1. Synonyms and related terms
+2. Common variations and abbreviations
+3. Related concepts that might appear in relevant documents
+
+Keep the expansion concise and focused. Return only the expanded query text, nothing else.
+
+Example:
+Query: "react hooks"
+Expanded: "react hooks useState useEffect custom hooks functional components lifecycle methods hook rules"
+"""
+    
+    try:
+        response = create_chat_completion(
+            model=model_choice,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that expands search queries for better retrieval."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=100
+        )
+        
+        expanded = response.choices[0].message.content.strip()
+        print(f"Query expanded from: '{query}' to: '{expanded}'")
+        return expanded
+    
+    except Exception as e:
+        print(f"Error expanding query: {e}. Using original query.")
+        return query
 
 def search_documents(
-    client: Client,
-    queries: List[str], # Changed from query: str
-    match_count: int = 10,
+    client: Client, 
+    query: str, 
+    match_count: int = 10, 
     filter_metadata: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for documents in Supabase using vector similarity for multiple queries.
-    Consolidates and de-duplicates results.
+    Search for documents in Supabase using vector similarity.
     
     Args:
         client: Supabase client
-        queries: List of query texts (original + expanded)
-        match_count: Maximum number of results to return in the final list
+        query: Query text
+        match_count: Maximum number of results to return
         filter_metadata: Optional metadata filter
         
     Returns:
-        Consolidated list of matching documents
+        List of matching documents
     """
-    if not queries:
+    # Expand the query if enabled
+    expanded_query = expand_query(query)
+    
+    # Create embedding for the expanded query
+    query_embedding = create_embedding(expanded_query)
+    
+    # Execute the search using the match_crawled_pages function
+    try:
+        # Always include all parameters to avoid function overloading ambiguity
+        params = {
+            'query_embedding': query_embedding,
+            'match_count': match_count,
+            'filter': filter_metadata if filter_metadata else {},
+            'source_filter': None  # Always include source_filter to match the function signature
+        }
+        
+        result = client.rpc('match_crawled_pages', params).execute()
+        
+        return result.data
+    except Exception as e:
+        print(f"Error searching documents: {e}")
         return []
 
-    all_embeddings = create_embeddings_batch(queries)
-    if not all_embeddings or len(all_embeddings) != len(queries):
-        # Fallback to original query if batch embedding fails for some reason
-        if queries:
-             single_embedding = create_embedding(queries[0])
-             if single_embedding and any(v != 0.0 for v in single_embedding): # Check if not empty embedding
-                 all_embeddings = [single_embedding]
-             else:
-                 print("Failed to create embeddings for any query.")
-                 return []
-        else: # Should not happen if initial check `if not queries:` passes
-            return []
-            
-    all_results = []
-    # Determine how many results to fetch per query.
-    # A simple approach: fetch match_count for the primary query,
-    # and fewer for expanded queries to control total results before deduplication.
-    # Or, fetch match_count for all and rely on deduplication and final trim.
-    # For now, let's fetch match_count for each to maximize chances of finding relevant docs.
+
+def extract_code_blocks(markdown_content: str, min_length: int = 1000) -> List[Dict[str, Any]]:
+    """
+    Extract code blocks from markdown content along with context.
     
-    for i, query_embedding in enumerate(all_embeddings):
-        # Skip if embedding is effectively empty (all zeros)
-        if not any(v != 0.0 for v in query_embedding):
-            print(f"Skipping query '{queries[i]}' due to empty embedding.")
-            continue
-
-        try:
-            params = {
-                'query_embedding': query_embedding,
-                'match_count': match_count # Fetch match_count for each query variant
-            }
-            if filter_metadata:
-                params['filter'] = filter_metadata
-            
-            result = client.rpc('match_crawled_pages', params).execute()
-            if result.data:
-                all_results.extend(result.data)
-        except Exception as e:
-            print(f"Error searching documents for query '{queries[i]}': {e}")
-            continue # Continue with other queries
-
-    # Consolidate and de-duplicate results
-    unique_documents = {}
-    for doc in all_results:
-        # Create a unique ID for each document chunk.
-        # Assuming 'id' is the primary key from 'crawled_pages' table returned by RPC.
-        # If 'id' is not available or not unique per chunk, use url + chunk_number.
-        doc_id_val = doc.get('id') # Supabase typically returns an 'id' for each row.
-        if doc_id_val is None: # Fallback if 'id' is not in the result
-            doc_id_val = f"{doc.get('url')}_{doc.get('chunk_number', doc.get('metadata', {}).get('chunk_index'))}"
-
-
-        if doc_id_val not in unique_documents:
-            unique_documents[doc_id_val] = doc
+    Args:
+        markdown_content: The markdown content to extract code blocks from
+        min_length: Minimum length of code blocks to extract (default: 1000 characters)
+        
+    Returns:
+        List of dictionaries containing code blocks and their context
+    """
+    code_blocks = []
+    
+    # Skip if content starts with triple backticks (edge case for files wrapped in backticks)
+    content = markdown_content.strip()
+    start_offset = 0
+    if content.startswith('```'):
+        # Skip the first triple backticks
+        start_offset = 3
+        print("Skipping initial triple backticks")
+    
+    # Find all occurrences of triple backticks
+    backtick_positions = []
+    pos = start_offset
+    while True:
+        pos = markdown_content.find('```', pos)
+        if pos == -1:
+            break
+        backtick_positions.append(pos)
+        pos += 3
+    
+    # Process pairs of backticks
+    i = 0
+    while i < len(backtick_positions) - 1:
+        start_pos = backtick_positions[i]
+        end_pos = backtick_positions[i + 1]
+        
+        # Extract the content between backticks
+        code_section = markdown_content[start_pos+3:end_pos]
+        
+        # Check if there's a language specifier on the first line
+        lines = code_section.split('\n', 1)
+        if len(lines) > 1:
+            # Check if first line is a language specifier (no spaces, common language names)
+            first_line = lines[0].strip()
+            if first_line and not ' ' in first_line and len(first_line) < 20:
+                language = first_line
+                code_content = lines[1].strip() if len(lines) > 1 else ""
+            else:
+                language = ""
+                code_content = code_section.strip()
         else:
-            # Optional: If a document is found via multiple queries,
-            # one might implement a re-scoring logic here.
-            # For now, first-come, first-served.
-            pass 
-            
-    consolidated_results = list(unique_documents.values())
+            language = ""
+            code_content = code_section.strip()
+        
+        # Skip if code block is too short
+        if len(code_content) < min_length:
+            i += 2  # Move to next pair
+            continue
+        
+        # Extract context before (1000 chars)
+        context_start = max(0, start_pos - 1000)
+        context_before = markdown_content[context_start:start_pos].strip()
+        
+        # Extract context after (1000 chars)
+        context_end = min(len(markdown_content), end_pos + 3 + 1000)
+        context_after = markdown_content[end_pos + 3:context_end].strip()
+        
+        code_blocks.append({
+            'code': code_content,
+            'language': language,
+            'context_before': context_before,
+            'context_after': context_after,
+            'full_context': f"{context_before}\n\n{code_content}\n\n{context_after}"
+        })
+        
+        # Move to next pair (skip the closing backtick we just processed)
+        i += 2
     
-    # Sort by similarity if available and desired.
-    # The current Supabase RPC `match_crawled_pages` should return them sorted by similarity for each call.
-    # After merging, this order is partially lost. A simple re-sort if similarity is consistent:
-    # consolidated_results.sort(key=lambda x: x.get('similarity', 0), reverse=True)
-    # However, 'similarity' scores from different query embeddings might not be directly comparable.
-    # For now, we rely on the initial sort and deduplication.
+    return code_blocks
 
-    # Trim to final match_count
-    return consolidated_results[:match_count]
 
-async def _get_relevance_score_for_document(
-    doc_content: str, original_query: str, reranker_model_choice: str
-) -> Optional[float]:
+def generate_code_example_summary(code: str, context_before: str, context_after: str) -> str:
     """
-    Helper async function to get relevance score for a single document.
-    Returns a float score or None if scoring fails.
+    Generate a summary for a code example using its surrounding context.
+    
+    Args:
+        code: The code example
+        context_before: Context before the code
+        context_after: Context after the code
+        
+    Returns:
+        A summary of what the code example demonstrates
     """
-    prompt = f"""Given the User Query and the Document content below:
+    model_choice = os.getenv("MODEL_CHOICE")
+    
+    # Create the prompt
+    prompt = f"""<context_before>
+{context_before[-500:] if len(context_before) > 500 else context_before}
+</context_before>
 
-User Query:
-{original_query}
+<code_example>
+{code[:1500] if len(code) > 1500 else code}
+</code_example>
 
-Document:
-{doc_content[:4000]} # Truncate doc_content to avoid excessive token usage
+<context_after>
+{context_after[:500] if len(context_after) > 500 else context_after}
+</context_after>
 
-Based on the Document's content, how relevant is it to the User Query?
-Please provide a relevance score as a single floating-point number between 0.0 (not relevant) and 1.0 (highly relevant).
-Output only the numerical score and nothing else. For example: 0.75
+Based on the code example and its surrounding context, provide a concise summary (2-3 sentences) that describes what this code example demonstrates and its purpose. Focus on the practical application and key concepts illustrated.
 """
+    
     try:
-        response = await aclient.chat.completions.create(
-            model=reranker_model_choice,
+        response = create_chat_completion(
+            model=model_choice,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are an AI assistant that evaluates document relevance to a query and returns a numerical score.",
-                },
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
+                {"role": "user", "content": prompt}
             ],
-            temperature=0.2,
-            max_tokens=10, # Expecting just a number like "0.75"
+            temperature=0.3,
+            max_tokens=100
         )
-        score_text = response.choices[0].message.content.strip()
-        try:
-            score = float(score_text)
-            return max(0.0, min(1.0, score)) # Clamp score between 0.0 and 1.0
-        except ValueError:
-            print(f"Could not parse relevance score from LLM response: '{score_text}' for query '{original_query}'")
-            return None
+        
+        return response.choices[0].message.content.strip()
+    
     except Exception as e:
-        print(f"Error calling LLM for relevance scoring (query: '{original_query}'): {e}")
-        return None
+        print(f"Error generating code example summary: {e}")
+        return "Code example for demonstration purposes."
 
-async def rerank_retrieved_documents(
-    original_query: str,
-    documents: List[Dict[str, Any]],
-    reranker_model_choice: str,
-    # api_key is implicitly used by the aclient, so not needed as a direct param if aclient is global
+
+def add_code_examples_to_supabase(
+    client: Client,
+    urls: List[str],
+    chunk_numbers: List[int],
+    code_examples: List[str],
+    summaries: List[str],
+    metadatas: List[Dict[str, Any]],
+    batch_size: int = 20
+):
+    """
+    Add code examples to the Supabase code_examples table in batches.
+    
+    Args:
+        client: Supabase client
+        urls: List of URLs
+        chunk_numbers: List of chunk numbers
+        code_examples: List of code example contents
+        summaries: List of code example summaries
+        metadatas: List of metadata dictionaries
+        batch_size: Size of each batch for insertion
+    """
+    if not urls:
+        return
+        
+    # Delete existing records for these URLs
+    unique_urls = list(set(urls))
+    for url in unique_urls:
+        try:
+            client.table('code_examples').delete().eq('url', url).execute()
+        except Exception as e:
+            print(f"Error deleting existing code examples for {url}: {e}")
+    
+    # Process in batches
+    total_items = len(urls)
+    for i in range(0, total_items, batch_size):
+        batch_end = min(i + batch_size, total_items)
+        batch_texts = []
+        
+        # Create combined texts for embedding (code + summary)
+        for j in range(i, batch_end):
+            combined_text = f"{code_examples[j]}\n\nSummary: {summaries[j]}"
+            batch_texts.append(combined_text)
+        
+        # Create embeddings for the batch
+        embeddings = create_embeddings_batch(batch_texts)
+        
+        # Check if embeddings are valid (not all zeros)
+        valid_embeddings = []
+        for embedding in embeddings:
+            if embedding and not all(v == 0.0 for v in embedding):
+                valid_embeddings.append(embedding)
+            else:
+                print(f"Warning: Zero or invalid embedding detected, creating new one...")
+                # Try to create a single embedding as fallback
+                single_embedding = create_embedding(batch_texts[len(valid_embeddings)])
+                valid_embeddings.append(single_embedding)
+        
+        # Prepare batch data
+        batch_data = []
+        for j, embedding in enumerate(valid_embeddings):
+            idx = i + j
+            
+            # Extract source_id from URL
+            parsed_url = urlparse(urls[idx])
+            source_id = parsed_url.netloc or parsed_url.path
+            
+            batch_data.append({
+                'url': urls[idx],
+                'chunk_number': chunk_numbers[idx],
+                'content': code_examples[idx],
+                'summary': summaries[idx],
+                'metadata': metadatas[idx],  # Store as JSON object, not string
+                'source_id': source_id,
+                'embedding': embedding
+            })
+        
+        # Insert batch into Supabase with retry logic
+        max_retries = 3
+        retry_delay = 1.0  # Start with 1 second delay
+        
+        for retry in range(max_retries):
+            try:
+                client.table('code_examples').insert(batch_data).execute()
+                # Success - break out of retry loop
+                break
+            except Exception as e:
+                if retry < max_retries - 1:
+                    print(f"Error inserting batch into Supabase (attempt {retry + 1}/{max_retries}): {e}")
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    # Final attempt failed
+                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
+                    # Optionally, try inserting records one by one as a last resort
+                    print("Attempting to insert records individually...")
+                    successful_inserts = 0
+                    for record in batch_data:
+                        try:
+                            client.table('code_examples').insert(record).execute()
+                            successful_inserts += 1
+                        except Exception as individual_error:
+                            print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
+                    
+                    if successful_inserts > 0:
+                        print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+        print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
+
+
+def update_source_info(client: Client, source_id: str, summary: str, word_count: int):
+    """
+    Update or insert source information in the sources table.
+    
+    Args:
+        client: Supabase client
+        source_id: The source ID (domain)
+        summary: Summary of the source
+        word_count: Total word count for the source
+    """
+    try:
+        # Try to update existing source
+        result = client.table('sources').update({
+            'summary': summary,
+            'total_word_count': word_count,
+            'updated_at': 'now()'
+        }).eq('source_id', source_id).execute()
+        
+        # If no rows were updated, insert new source
+        if not result.data:
+            client.table('sources').insert({
+                'source_id': source_id,
+                'summary': summary,
+                'total_word_count': word_count
+            }).execute()
+            print(f"Created new source: {source_id}")
+        else:
+            print(f"Updated source: {source_id}")
+            
+    except Exception as e:
+        print(f"Error updating source {source_id}: {e}")
+
+
+def extract_source_summary(source_id: str, content: str, max_length: int = 500) -> str:
+    """
+    Extract a summary for a source from its content using an LLM.
+    
+    This function uses the OpenAI API to generate a concise summary of the source content.
+    
+    Args:
+        source_id: The source ID (domain)
+        content: The content to extract a summary from
+        max_length: Maximum length of the summary
+        
+    Returns:
+        A summary string
+    """
+    # Default summary if we can't extract anything meaningful
+    default_summary = f"Content from {source_id}"
+    
+    if not content or len(content.strip()) == 0:
+        return default_summary
+    
+    # Get the model choice from environment variables
+    model_choice = os.getenv("MODEL_CHOICE")
+    
+    # Limit content length to avoid token limits
+    truncated_content = content[:25000] if len(content) > 25000 else content
+    
+    # Create the prompt for generating the summary
+    prompt = f"""<source_content>
+{truncated_content}
+</source_content>
+
+The above content is from the documentation for '{source_id}'. Please provide a concise summary (3-5 sentences) that describes what this library/tool/framework is about. The summary should help understand what the library/tool/framework accomplishes and the purpose.
+"""
+    
+    try:
+        # Call the LLM API to generate the summary
+        response = create_chat_completion(
+            model=model_choice,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=150
+        )
+        
+        # Extract the generated summary
+        summary = response.choices[0].message.content.strip()
+        
+        # Ensure the summary is not too long
+        if len(summary) > max_length:
+            summary = summary[:max_length] + "..."
+            
+        return summary
+    
+    except Exception as e:
+        print(f"Error generating summary with LLM for {source_id}: {e}. Using default summary.")
+        return default_summary
+
+
+def search_code_examples(
+    client: Client, 
+    query: str, 
+    match_count: int = 10, 
+    filter_metadata: Optional[Dict[str, Any]] = None,
+    source_id: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Re-ranks retrieved documents based on LLM-evaluated relevance to the original query.
+    Search for code examples in Supabase using vector similarity.
+    
+    Args:
+        client: Supabase client
+        query: Query text
+        match_count: Maximum number of results to return
+        filter_metadata: Optional metadata filter
+        source_id: Optional source ID to filter results
+        
+    Returns:
+        List of matching code examples
     """
-    if not reranker_model_choice or not documents:
-        print("Skipping reranking: No reranker model specified or no documents to rank.")
-        return documents
-
-    if not os.getenv("OPENAI_API_KEY"):
-        print("Skipping reranking: OPENAI_API_KEY not found.")
-        return documents
-
-    print(f"Reranking {len(documents)} documents using model: {reranker_model_choice} for query: '{original_query}'")
-
-    # Create a list of tasks for asyncio.gather
-    tasks = [
-        _get_relevance_score_for_document(
-            doc.get("content", ""), original_query, reranker_model_choice
-        )
-        for doc in documents
-    ]
+    # Expand the query if enabled
+    expanded_query = expand_query(query)
     
-    # Run all scoring tasks concurrently
-    scores = await asyncio.gather(*tasks, return_exceptions=True) # return_exceptions to handle individual failures
-
-    # Add scores to documents and handle potential errors from gather
-    for i, doc in enumerate(documents):
-        score_result = scores[i]
-        if isinstance(score_result, Exception):
-            print(f"Exception during scoring document {i}: {score_result}")
-            doc["relevance_score"] = 0.0  # Assign default low score on error
-        elif score_result is None:
-            doc["relevance_score"] = 0.0 # Assign default low score if parsing failed or LLM error
-        else:
-            doc["relevance_score"] = score_result
-            
-    # Sort documents by relevance_score in descending order
-    # If scores are equal, maintain original relative order (Python's sort is stable)
-    documents.sort(key=lambda x: x.get("relevance_score", 0.0), reverse=True)
+    # Create a more descriptive query for better embedding match
+    # Since code examples are embedded with their summaries, we should make the query more descriptive
+    enhanced_query = f"Code example for {expanded_query}\n\nSummary: Example code showing {expanded_query}"
     
-    print(f"Reranking completed. Top scores: {[doc.get('relevance_score') for doc in documents[:5]]}")
-    return documents
+    # Create embedding for the enhanced query
+    query_embedding = create_embedding(enhanced_query)
+    
+    # Execute the search using the match_code_examples function
+    try:
+        # Always include all parameters to avoid function overloading ambiguity
+        params = {
+            'query_embedding': query_embedding,
+            'match_count': match_count,
+            'filter': filter_metadata if filter_metadata else {},
+            'source_filter': source_id  # Use the source_id parameter directly
+        }
+        
+        result = client.rpc('match_code_examples', params).execute()
+        
+        return result.data
+    except Exception as e:
+        print(f"Error searching code examples: {e}")
+        return []

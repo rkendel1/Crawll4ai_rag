@@ -1,0 +1,6 @@
+pydantic-ai>=0.0.9
+httpx>=0.25.0
+logfire>=0.28.0
+devtools>=0.12.0
+gradio>=4.0.0
+python-dotenv>=1.0.0

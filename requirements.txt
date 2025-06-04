@@ -1,0 +1,4 @@
+pydantic-ai
+httpx
+python-dotenv
+huggingface_hub[hf_xet]
