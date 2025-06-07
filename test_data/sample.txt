@@ -1,0 +1,14 @@
+Sample Text Document for Testing
+This is a sample text document to test text processing.
+It contains some sample content about API documentation.
+
+API Documentation: Users Endpoint
+The /users endpoint allows you to manage user accounts.
+GET /users - Retrieve all users
+POST /users - Create a new user
+
+Page 2: Authentication
+Authentication is required for all API endpoints.
+Use Bearer token in Authorization header.
+Example: Authorization: Bearer your-token-here
+Token expiry: 24 hours

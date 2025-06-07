@@ -21,6 +21,7 @@ import json
 import os
 import re
 import concurrent.futures
+import logging
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 
@@ -33,8 +34,13 @@ from utils import (
     add_code_examples_to_supabase,
     update_source_info,
     extract_source_summary,
-    search_code_examples
+    search_code_examples,
+    create_embedding
 )
+
+# Import new processor modules
+from pdf_processor import PDFProcessor
+from openapi_processor import OpenAPIProcessor
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -42,6 +48,17 @@ dotenv_path = project_root / '.env'
 
 # Force override of existing environment variables
 load_dotenv(dotenv_path, override=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('crawl4ai_mcp.log', mode='a')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Create a dataclass for our application context
 @dataclass
@@ -97,11 +114,18 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
 # Initialize FastMCP server
 mcp = FastMCP(
     "mcp-crawl4ai-rag",
-    description="MCP server for RAG and web crawling with Crawl4AI",
+    description="MCP server for RAG and web crawling with Crawl4AI with PDF and OpenAPI support",
     lifespan=crawl4ai_lifespan,
     host=os.getenv("HOST", "0.0.0.0"),
     port=os.getenv("PORT", "8051")
 )
+
+# Initialize processor instances
+pdf_processor = PDFProcessor(
+    chunk_size=int(os.getenv("PDF_CHUNK_SIZE", "1000")),
+    overlap=int(os.getenv("PDF_CHUNK_OVERLAP", "200"))
+)
+openapi_processor = OpenAPIProcessor()
 
 def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
     """
@@ -945,6 +969,390 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
         return json.dumps({
             "success": False,
             "query": query,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
+async def ingest_pdf(ctx: Context, file_path: str) -> str:
+    """
+    Ingest a PDF file into the vector database for RAG queries.
+    
+    This tool extracts text content from PDF files, chunks it intelligently,
+    and stores it in the vector database for semantic search and RAG operations.
+    
+    Args:
+        ctx: The MCP server provided context
+        file_path: Path to the PDF file to ingest
+        
+    Returns:
+        JSON string with success status and ingestion details
+        
+    Examples:
+        - ingest_pdf("/docs/api-documentation.pdf")
+        - ingest_pdf("./manuals/user-guide.pdf")
+    """
+    try:
+        # Get the Supabase client from the context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Validate file path
+        if not file_path:
+            return json.dumps({
+                "success": False,
+                "error": "File path is required"
+            }, indent=2)
+        
+        # Convert to absolute path if relative
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = path.absolute()
+        
+        # Process PDF
+        logger.info(f"Starting PDF ingestion: {path}")
+        chunks = await pdf_processor.process_pdf(str(path))
+        
+        if not chunks:
+            return json.dumps({
+                "success": False,
+                "error": "No content extracted from PDF"
+            }, indent=2)
+        
+        # Prepare data for storage
+        urls = []
+        chunk_numbers = []
+        contents = []
+        metadatas = []
+        
+        for i, chunk in enumerate(chunks):
+            urls.append(chunk["metadata"]["source"])
+            chunk_numbers.append(i)
+            contents.append(chunk["content"])
+            metadatas.append(chunk["metadata"])
+        
+        # Create url_to_full_document mapping for contextual embeddings
+        url_to_full_document = {chunk["metadata"]["source"]: " ".join(contents)}
+        
+        # Extract source_id from first chunk
+        source_id = chunks[0]["metadata"]["filename"] if chunks else "unknown"
+        total_word_count = sum(chunk["metadata"].get("word_count", 0) for chunk in chunks)
+        
+        # Update source information
+        source_summary = f"PDF document: {source_id} ({len(chunks)} chunks, {total_word_count} words)"
+        update_source_info(supabase_client, source_id, source_summary, total_word_count)
+        
+        # Store chunks in Supabase
+        add_documents_to_supabase(
+            supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document
+        )
+        
+        logger.info(f"PDF ingestion completed: {len(chunks)} chunks stored")
+        
+        return json.dumps({
+            "success": True,
+            "file_path": str(path),
+            "filename": path.name,
+            "chunks_stored": len(chunks),
+            "total_pages": chunks[0]["metadata"].get("pages", 0) if chunks else 0,
+            "total_words": total_word_count,
+            "source_id": source_id
+        }, indent=2)
+        
+    except FileNotFoundError:
+        return json.dumps({
+            "success": False,
+            "error": f"PDF file not found at '{file_path}'"
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error ingesting PDF: {str(e)}")
+        return json.dumps({
+            "success": False,
+            "error": f"Error ingesting PDF: {str(e)}"
+        }, indent=2)
+
+@mcp.tool()
+async def ingest_openapi(ctx: Context, file_path: str, strategy: str = "combined") -> str:
+    """
+    Ingest an OpenAPI specification into the vector database for RAG queries.
+    
+    This tool parses OpenAPI/Swagger specifications, extracts endpoint and schema
+    information using configurable chunking strategies, and stores it for semantic search.
+    
+    Args:
+        ctx: The MCP server provided context
+        file_path: Path to the OpenAPI spec file (JSON or YAML)
+        strategy: Chunking strategy - 'endpoint', 'schema', 'combined', or 'operation'
+                 - endpoint: Create chunks for each API endpoint
+                 - schema: Create chunks for each data model/schema
+                 - combined: Create chunks for both endpoints and schemas (default)
+                 - operation: Group by operationId
+        
+    Returns:
+        JSON string with success status and ingestion details
+        
+    Examples:
+        - ingest_openapi("/specs/payment-api.yaml")
+        - ingest_openapi("./apis/user-service.json", strategy="endpoint")
+        - ingest_openapi("/docs/inventory-api.yaml", strategy="combined")
+    """
+    try:
+        # Get the Supabase client from the context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Validate inputs
+        if not file_path:
+            return json.dumps({
+                "success": False,
+                "error": "File path is required"
+            }, indent=2)
+        
+        valid_strategies = ["endpoint", "schema", "combined", "operation"]
+        if strategy not in valid_strategies:
+            return json.dumps({
+                "success": False,
+                "error": f"Invalid strategy. Must be one of: {', '.join(valid_strategies)}"
+            }, indent=2)
+        
+        # Convert to absolute path if relative
+        path = Path(file_path)
+        if not path.is_absolute():
+            path = path.absolute()
+        
+        # Process OpenAPI spec
+        logger.info(f"Starting OpenAPI ingestion: {path} (strategy: {strategy})")
+        chunks = await openapi_processor.process_openapi(str(path), strategy)
+        
+        if not chunks:
+            return json.dumps({
+                "success": False,
+                "error": "No content extracted from OpenAPI specification"
+            }, indent=2)
+        
+        # Prepare data for storage
+        urls = []
+        chunk_numbers = []
+        contents = []
+        metadatas = []
+        chunk_types = {}
+        
+        for i, chunk in enumerate(chunks):
+            urls.append(chunk["metadata"]["source"])
+            chunk_numbers.append(i)
+            contents.append(chunk["content"])
+            metadatas.append(chunk["metadata"])
+            
+            # Track chunk types
+            chunk_type = chunk["metadata"].get("chunk_type", "unknown")
+            chunk_types[chunk_type] = chunk_types.get(chunk_type, 0) + 1
+        
+        # Create url_to_full_document mapping for contextual embeddings
+        url_to_full_document = {chunk["metadata"]["source"]: " ".join(contents)}
+        
+        # Extract API info from first chunk
+        api_title = chunks[0]["metadata"].get("title", "Unknown API") if chunks else "Unknown API"
+        api_version = chunks[0]["metadata"].get("api_version", "1.0.0") if chunks else "1.0.0"
+        total_word_count = sum(len(content.split()) for content in contents)
+        
+        # Update source information
+        source_summary = f"OpenAPI specification: {api_title} v{api_version} ({len(chunks)} chunks, {strategy} strategy)"
+        update_source_info(supabase_client, api_title, source_summary, total_word_count)
+        
+        # Store chunks in Supabase
+        add_documents_to_supabase(
+            supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document
+        )
+        
+        logger.info(f"OpenAPI ingestion completed: {len(chunks)} chunks stored")
+        
+        return json.dumps({
+            "success": True,
+            "file_path": str(path),
+            "filename": path.name,
+            "api_title": api_title,
+            "api_version": api_version,
+            "strategy": strategy,
+            "chunks_stored": len(chunks),
+            "chunk_breakdown": chunk_types,
+            "total_words": total_word_count,
+            "source_id": api_title
+        }, indent=2)
+        
+    except FileNotFoundError:
+        return json.dumps({
+            "success": False,
+            "error": f"OpenAPI spec file not found at '{file_path}'"
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error ingesting OpenAPI spec: {str(e)}")
+        return json.dumps({
+            "success": False,
+            "error": f"Error ingesting OpenAPI spec: {str(e)}"
+        }, indent=2)
+
+@mcp.tool()
+async def search_api_endpoints(ctx: Context, query: str, api_name: Optional[str] = None, match_count: int = 10) -> str:
+    """
+    Search for API endpoints matching the query using semantic search.
+    
+    This tool searches through ingested OpenAPI specifications to find endpoints
+    that match the given query. It filters for endpoint-specific chunks and provides
+    detailed information about matching API operations.
+    
+    Args:
+        ctx: The MCP server provided context
+        query: Search query (e.g., "payment", "create user", "authentication")
+        api_name: Optional API name/title to filter results
+        match_count: Maximum number of results to return (default: 10)
+        
+    Returns:
+        JSON string with matching endpoints and their details
+        
+    Examples:
+        - search_api_endpoints("payment processing")
+        - search_api_endpoints("user", api_name="User Service API")
+        - search_api_endpoints("POST", match_count=20)
+    """
+    try:
+        # Get the Supabase client from the context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Prepare filter if api_name is provided and not empty
+        filter_metadata = None
+        if api_name and api_name.strip():
+            filter_metadata = {"title": api_name}
+        
+        # Use the existing search_documents function with enhanced filtering
+        results = search_documents(
+            client=supabase_client,
+            query=query,
+            match_count=match_count * 2,  # Get more results for filtering
+            filter_metadata=filter_metadata
+        )
+        
+        # Filter for endpoint-specific results
+        endpoint_results = []
+        seen_endpoints = set()
+        
+        for result in results:
+            metadata = result.get("metadata", {})
+            
+            # Check if this is an endpoint chunk
+            if metadata.get("chunk_type") == "endpoint" or metadata.get("endpoint"):
+                endpoint_key = metadata.get("endpoint", "")
+                
+                # Avoid duplicates
+                if endpoint_key and endpoint_key not in seen_endpoints:
+                    seen_endpoints.add(endpoint_key)
+                    
+                    endpoint_results.append({
+                        "endpoint": endpoint_key,
+                        "operation_id": metadata.get("operation_id", ""),
+                        "summary": metadata.get("summary", ""),
+                        "tags": metadata.get("tags", []),
+                        "api_title": metadata.get("title", ""),
+                        "api_version": metadata.get("api_version", ""),
+                        "content": result.get("content", ""),
+                        "similarity": result.get("similarity", 0.0),
+                        "source": metadata.get("source", "")
+                    })
+            
+            # Stop if we have enough results
+            if len(endpoint_results) >= match_count:
+                break
+        
+        # Sort by similarity score
+        endpoint_results.sort(key=lambda x: x["similarity"], reverse=True)
+        
+        logger.info(f"Found {len(endpoint_results)} endpoints for query: {query}")
+        
+        return json.dumps({
+            "success": True,
+            "query": query,
+            "api_filter": api_name,
+            "results": endpoint_results,
+            "count": len(endpoint_results)
+        }, indent=2)
+        
+    except Exception as e:
+        logger.error(f"Error searching API endpoints: {str(e)}")
+        return json.dumps({
+            "success": False,
+            "query": query,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
+async def list_ingested_apis(ctx: Context) -> str:
+    """
+    List all APIs that have been ingested into the system.
+    
+    This tool queries the database to find all unique OpenAPI specifications
+    that have been processed and stored, providing an overview of available
+    API documentation for search and retrieval.
+    
+    Args:
+        ctx: The MCP server provided context
+        
+    Returns:
+        JSON string with list of ingested APIs and their metadata
+        
+    Example:
+        - list_ingested_apis()
+    """
+    try:
+        # Get the Supabase client from the context
+        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        
+        # Query for unique API sources
+        result = supabase_client.table("crawled_pages").select(
+            "metadata"
+        ).eq(
+            "metadata->>type", "openapi"
+        ).execute()
+        
+        # Extract unique APIs
+        apis = {}
+        for row in result.data:
+            metadata = row.get("metadata", {})
+            if metadata.get("type") == "openapi":
+                api_key = metadata.get("title", "Unknown API")
+                if api_key not in apis:
+                    apis[api_key] = {
+                        "title": metadata.get("title", "Unknown API"),
+                        "version": metadata.get("api_version", ""),
+                        "openapi_version": metadata.get("openapi_version", ""),
+                        "description": metadata.get("description", ""),
+                        "source": metadata.get("source", ""),
+                        "filename": metadata.get("filename", ""),
+                        "ingested_at": metadata.get("extracted_at", "")
+                    }
+        
+        # Also check sources table for additional info
+        try:
+            sources_result = supabase_client.table("sources").select("*").execute()
+            for source in sources_result.data:
+                source_id = source.get("source_id", "")
+                # Check if this source corresponds to an API
+                for api_title, api_info in apis.items():
+                    if source_id == api_title:
+                        api_info["summary"] = source.get("summary", "")
+                        api_info["total_words"] = source.get("total_words", 0)
+                        break
+        except Exception as e:
+            logger.warning(f"Could not fetch additional source info: {e}")
+        
+        api_list = list(apis.values())
+        logger.info(f"Found {len(api_list)} ingested APIs")
+        
+        return json.dumps({
+            "success": True,
+            "apis": api_list,
+            "count": len(api_list)
+        }, indent=2)
+        
+    except Exception as e:
+        logger.error(f"Error listing ingested APIs: {str(e)}")
+        return json.dumps({
+            "success": False,
             "error": str(e)
         }, indent=2)
 
