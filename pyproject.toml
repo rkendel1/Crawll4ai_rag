@@ -7,8 +7,15 @@ requires-python = ">=3.12"
 dependencies = [
     "crawl4ai==0.6.2",
     "mcp==1.7.1",
-    "supabase==2.15.1",
-    "openai==1.71.0",
+    "openai==1.71.0",                        # (Optional) For fallback embeddings/LLM, if needed
     "dotenv==0.9.9",
     "sentence-transformers>=4.1.0",
+    "sqlalchemy>=2.0.0",                     # For Postgres DB access
+    "psycopg2-binary>=2.9.0",                # Postgres driver
+    "pgvector>=0.2.4",                       # Python client for pgvector extension
+    "requests>=2.31.0",                      # For HTTP requests to Ollama etc.
+    "httpx>=0.27.0",                         # For async Ollama or other HTTP calls if needed
 ]
+
+[tool.setuptools]
+packages = ["src"]
