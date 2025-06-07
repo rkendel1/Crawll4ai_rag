@@ -1,0 +1,238 @@
+components:
+  schemas:
+    CreateUserRequest:
+      description: Request body for creating a new user
+      properties:
+        email:
+          format: email
+          type: string
+        name:
+          maxLength: 100
+          minLength: 1
+          type: string
+        role:
+          default: user
+          enum:
+          - user
+          - admin
+          type: string
+      required:
+      - name
+      - email
+      type: object
+    LoginRequest:
+      properties:
+        email:
+          format: email
+          type: string
+        password:
+          minLength: 8
+          type: string
+      required:
+      - email
+      - password
+      type: object
+    LoginResponse:
+      properties:
+        access_token:
+          type: string
+        expires_in:
+          description: Token expiry in seconds
+          type: integer
+        token_type:
+          default: Bearer
+          type: string
+        user:
+          $ref: '#/components/schemas/User'
+      required:
+      - access_token
+      - token_type
+      - expires_in
+      - user
+      type: object
+    User:
+      description: User object with account information
+      properties:
+        created_at:
+          description: Account creation timestamp
+          format: date-time
+          type: string
+        email:
+          description: User's email address
+          format: email
+          type: string
+        id:
+          description: Unique user identifier
+          format: uuid
+          type: string
+        name:
+          description: User's full name
+          type: string
+        role:
+          description: User's role in the system
+          enum:
+          - admin
+          - user
+          - guest
+          type: string
+        status:
+          description: Current user status
+          enum:
+          - active
+          - inactive
+          - pending
+          type: string
+      required:
+      - id
+      - name
+      - email
+      - role
+      type: object
+  securitySchemes:
+    bearerAuth:
+      bearerFormat: JWT
+      description: JWT token for authentication
+      scheme: bearer
+      type: http
+info:
+  contact:
+    email: support@testapi.com
+    name: API Support
+  description: A comprehensive test API for validation and demonstration
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  title: Test API
+  version: 1.0.0
+openapi: 3.0.0
+paths:
+  /auth/login:
+    post:
+      description: Authenticate user and return access token
+      operationId: login
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+          description: Login successful
+        '401':
+          description: Invalid credentials
+      summary: User login
+      tags:
+      - auth
+  /users:
+    get:
+      description: Retrieve a list of all users with optional filtering
+      operationId: getUsers
+      parameters:
+      - description: Maximum number of users to return
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 10
+          maximum: 100
+          minimum: 1
+          type: integer
+      - description: Filter users by status
+        in: query
+        name: status
+        required: false
+        schema:
+          enum:
+          - active
+          - inactive
+          - pending
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/User'
+                type: array
+          description: List of users
+        '400':
+          description: Bad request
+      security:
+      - bearerAuth: []
+      summary: Get all users
+      tags:
+      - users
+    post:
+      description: Create a new user account
+      operationId: createUser
+      requestBody:
+        content:
+          application/json:
+            example:
+              email: john@example.com
+              name: John Doe
+              role: user
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+          description: User created successfully
+        '400':
+          description: Invalid input
+        '409':
+          description: User already exists
+      security:
+      - bearerAuth:
+        - admin
+      summary: Create a user
+      tags:
+      - users
+  /users/{id}:
+    get:
+      description: Retrieve a specific user by their ID
+      operationId: getUserById
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        schema:
+          format: uuid
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+          description: User details
+        '404':
+          description: User not found
+      security:
+      - bearerAuth: []
+      summary: Get user by ID
+      tags:
+      - users
+security:
+- bearerAuth: []
+servers:
+- description: Production server
+  url: https://api.test.com/v1
+- description: Staging server
+  url: https://staging-api.test.com/v1
+tags:
+- description: User management operations
+  name: users
+- description: Authentication and authorization
+  name: auth

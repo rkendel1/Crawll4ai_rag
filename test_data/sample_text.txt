@@ -1,0 +1,193 @@
+Sample API Documentation - User Management System
+
+This document provides comprehensive information about the User Management API endpoints.
+
+Overview
+========
+The User Management API allows you to create, read, update, and delete user accounts. 
+All endpoints require authentication via Bearer token unless otherwise specified.
+
+Base URL: https://api.example.com/v1
+
+Authentication
+==============
+All API requests must include an Authorization header with a valid Bearer token:
+Authorization: Bearer your-jwt-token-here
+
+Token expiry: 24 hours
+Refresh tokens: Available for extended sessions
+
+User Endpoints
+==============
+
+GET /users
+----------
+Retrieve a list of all users with optional filtering.
+
+Parameters:
+- limit (query, optional): Maximum number of users to return (default: 10, max: 100)
+- status (query, optional): Filter by user status (active, inactive, pending)
+- role (query, optional): Filter by user role (admin, user, guest)
+
+Response:
+200 OK - Returns array of user objects
+400 Bad Request - Invalid parameters
+401 Unauthorized - Invalid or missing token
+
+Example Response:
+{
+  "users": [
+    {
+      "id": "123e4567-e89b-12d3-a456-426614174000",
+      "name": "John Doe",
+      "email": "john@example.com",
+      "role": "user",
+      "status": "active",
+      "created_at": "2023-01-15T10:30:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1
+}
+
+POST /users
+-----------
+Create a new user account.
+
+Request Body:
+{
+  "name": "string (required)",
+  "email": "string (required, valid email)",
+  "role": "string (optional, default: user)",
+  "password": "string (required, min 8 characters)"
+}
+
+Response:
+201 Created - User created successfully
+400 Bad Request - Invalid input data
+409 Conflict - User already exists
+
+GET /users/{id}
+---------------
+Retrieve a specific user by their unique identifier.
+
+Parameters:
+- id (path, required): User UUID
+
+Response:
+200 OK - Returns user object
+404 Not Found - User does not exist
+401 Unauthorized - Invalid token
+
+PUT /users/{id}
+---------------
+Update an existing user's information.
+
+Parameters:
+- id (path, required): User UUID
+
+Request Body (all fields optional):
+{
+  "name": "string",
+  "email": "string",
+  "role": "string",
+  "status": "string"
+}
+
+Response:
+200 OK - User updated successfully
+400 Bad Request - Invalid input data
+404 Not Found - User does not exist
+401 Unauthorized - Invalid token
+403 Forbidden - Insufficient permissions
+
+DELETE /users/{id}
+------------------
+Delete a user account (soft delete - marks as inactive).
+
+Parameters:
+- id (path, required): User UUID
+
+Response:
+204 No Content - User deleted successfully
+404 Not Found - User does not exist
+401 Unauthorized - Invalid token
+403 Forbidden - Insufficient permissions
+
+Error Handling
+==============
+All errors return a consistent format:
+
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human readable error message",
+    "details": "Additional error details if available"
+  }
+}
+
+Common Error Codes:
+- INVALID_TOKEN: Authentication token is invalid or expired
+- INSUFFICIENT_PERMISSIONS: User lacks required permissions
+- VALIDATION_ERROR: Request data failed validation
+- RESOURCE_NOT_FOUND: Requested resource does not exist
+- RATE_LIMIT_EXCEEDED: Too many requests in time window
+
+Rate Limiting
+=============
+API requests are limited to 1000 requests per hour per authenticated user.
+Rate limit headers are included in all responses:
+
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 999
+X-RateLimit-Reset: 1609459200
+
+Security Considerations
+=======================
+- Always use HTTPS in production
+- Store tokens securely (never in localStorage)
+- Implement proper CORS policies
+- Use strong, unique passwords
+- Enable two-factor authentication when available
+
+SDK and Libraries
+=================
+Official SDKs are available for:
+- JavaScript/Node.js
+- Python
+- Java
+- Go
+- C#
+
+Example usage in Python:
+```python
+import requests
+
+headers = {
+    'Authorization': 'Bearer your-token-here',
+    'Content-Type': 'application/json'
+}
+
+# Get all users
+response = requests.get(
+    'https://api.example.com/v1/users',
+    headers=headers
+)
+
+users = response.json()
+print(f"Found {len(users['users'])} users")
+```
+
+Support and Resources
+====================
+- API Documentation: https://docs.example.com
+- Developer Portal: https://developer.example.com
+- Support Email: api-support@example.com
+- Status Page: https://status.example.com
+
+Version History
+===============
+v1.0 - Initial release with basic CRUD operations
+v1.1 - Added filtering and pagination
+v1.2 - Enhanced security and rate limiting
+v1.3 - Added batch operations (current version)

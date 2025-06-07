@@ -1,7 +1,7 @@
 [project]
 name = "crawl4ai-mcp"
 version = "0.1.0"
-description = "MCP server for integrating web crawling and RAG into AI agents and AI coding assistants"
+description = "MCP server for integrating web crawling and RAG into AI agents and AI coding assistants with PDF and OpenAPI support"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,4 +11,13 @@ dependencies = [
     "openai==1.71.0",
     "dotenv==0.9.9",
     "sentence-transformers>=4.1.0",
+    # PDF processing dependencies
+    "pdfplumber>=0.10.0",
+    "pypdf2>=3.0.0",
+    "unstructured[pdf]>=0.10.0",
+    # OpenAPI processing dependencies
+    "openapi-spec-validator>=0.6.0",
+    "prance>=23.0.0",
+    "jsonschema>=4.0.0",
+    "pyyaml>=6.0.1",
 ]
