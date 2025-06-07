@@ -3,7 +3,7 @@ name = "crawl4ai-mcp"
 version = "0.1.0"
 description = "MCP server for integrating web crawling and RAG into AI agents and AI coding assistants"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<4.0"
 dependencies = [
     "crawl4ai==0.6.2",
     "mcp==1.7.1",

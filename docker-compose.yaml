@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  crawl4ai:
+    build:
+      context: .
+      args:
+        PORT: 8051
+    env_file:
+      - .env
+    ports:
+      - "8051:8051"
+    environment:
+      - DATABASE_URL
+      - OLLAMA_MODEL
+      - OLLAMA_BASE_URL
+      - OPENAI_API_KEY
+      - MODEL_CHOICE
+      - USE_CONTEXTUAL_EMBEDDINGS
+      - USE_HYBRID_SEARCH
+      - USE_AGENTIC_RAG
+      - USE_RERANKING
